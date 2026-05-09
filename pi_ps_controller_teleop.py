@@ -30,6 +30,7 @@ DEFAULT_RPM = 25.0
 SPEED_CHANGE_RPM_PER_S = 24.0
 
 STICK_DEADZONE = 0.18
+TRIGGER_DEADZONE = 0.08
 TWIST_SEND_INTERVAL_S = 0.08
 TWIST_TIMEOUT_MS = 300
 TELEOP_ACK_TIMEOUT_S = 0.20
@@ -62,6 +63,12 @@ JS_EVENT_INIT = 0x80
 JSIOCGAXES = 0x80016A11
 JSIOCGBUTTONS = 0x80016A12
 
+LINUX_DUALSENSE_AXIS_RIGHT_X = int(os.environ.get("PS_LINUX_AXIS_RIGHT_X", "3"))
+LINUX_DUALSENSE_AXIS_LEFT_TRIGGER = int(os.environ.get("PS_LINUX_AXIS_L2", "2"))
+LINUX_DUALSENSE_AXIS_RIGHT_TRIGGER = int(os.environ.get("PS_LINUX_AXIS_R2", "5"))
+LINUX_DUALSENSE_BTN_L1 = int(os.environ.get("PS_LINUX_BTN_L1", "4"))
+LINUX_DUALSENSE_BTN_R1 = int(os.environ.get("PS_LINUX_BTN_R1", "5"))
+
 
 def jsiocgname(length: int) -> int:
     return 0x80006A13 + (length << 16)
@@ -79,6 +86,37 @@ class Twist:
             or abs(self.strafe_rpm) > 0.01
             or abs(self.turn_rpm) > 0.01
         )
+
+
+@dataclass(frozen=True)
+class ControllerMapping:
+    left_x: int
+    left_y: int
+    right_x: int
+    left_trigger: int
+    right_trigger: int
+    button_cross: int
+    button_circle: int
+    button_square: int
+    button_triangle: int
+    button_l1: int
+    button_r1: int
+
+
+class ControllerState:
+    def __init__(self, joystick, mapping: ControllerMapping) -> None:
+        self.joystick = joystick
+        self.mapping = mapping
+        self.axis_centers = {
+            mapping.left_x: get_axis(joystick, mapping.left_x),
+            mapping.left_y: get_axis(joystick, mapping.left_y),
+            mapping.right_x: get_axis(joystick, mapping.right_x),
+        }
+
+    def centered_axis(self, axis_index: int) -> float:
+        raw_value = get_axis(self.joystick, axis_index)
+        center = self.axis_centers.get(axis_index, 0.0)
+        return clamp(raw_value - center, -1.0, 1.0)
 
 
 class ButtonEdges:
@@ -99,10 +137,15 @@ class TriggerAxis:
     def value(self, raw_value: float) -> float:
         if self.idle_value <= 0.5:
             denom = max(1.0 - self.idle_value, 0.001)
-            return clamp((raw_value - self.idle_value) / denom, 0.0, 1.0)
+            value = clamp((raw_value - self.idle_value) / denom, 0.0, 1.0)
+        else:
+            denom = max(self.idle_value + 1.0, 0.001)
+            value = clamp((self.idle_value - raw_value) / denom, 0.0, 1.0)
 
-        denom = max(self.idle_value + 1.0, 0.001)
-        return clamp((self.idle_value - raw_value) / denom, 0.0, 1.0)
+        if value <= TRIGGER_DEADZONE:
+            return 0.0
+
+        return clamp((value - TRIGGER_DEADZONE) / (1.0 - TRIGGER_DEADZONE), 0.0, 1.0)
 
 
 class LinuxJoystick:
@@ -291,8 +334,41 @@ def get_button(joystick, button_index: int) -> bool:
     return bool(joystick.get_button(button_index))
 
 
+def controller_mapping_for(joystick) -> ControllerMapping:
+    mapping = ControllerMapping(
+        left_x=AXIS_LEFT_X,
+        left_y=AXIS_LEFT_Y,
+        right_x=AXIS_RIGHT_X,
+        left_trigger=AXIS_LEFT_TRIGGER,
+        right_trigger=AXIS_RIGHT_TRIGGER,
+        button_cross=BTN_CROSS,
+        button_circle=BTN_CIRCLE,
+        button_square=BTN_SQUARE,
+        button_triangle=BTN_TRIANGLE,
+        button_l1=BTN_L1,
+        button_r1=BTN_R1,
+    )
+
+    if isinstance(joystick, LinuxJoystick) and score_controller_name(joystick.get_name()) <= 1:
+        return ControllerMapping(
+            left_x=AXIS_LEFT_X,
+            left_y=AXIS_LEFT_Y,
+            right_x=LINUX_DUALSENSE_AXIS_RIGHT_X,
+            left_trigger=LINUX_DUALSENSE_AXIS_LEFT_TRIGGER,
+            right_trigger=LINUX_DUALSENSE_AXIS_RIGHT_TRIGGER,
+            button_cross=BTN_CROSS,
+            button_circle=BTN_CIRCLE,
+            button_square=BTN_SQUARE,
+            button_triangle=BTN_TRIANGLE,
+            button_l1=LINUX_DUALSENSE_BTN_L1,
+            button_r1=LINUX_DUALSENSE_BTN_R1,
+        )
+
+    return mapping
+
+
 def quantized_translation(left_x: float, left_y: float, speed_rpm: float) -> tuple[float, float]:
-    x = apply_deadzone(left_x)
+    x = apply_deadzone(-left_x)
     y = apply_deadzone(-left_y)
     magnitude = clamp(math.hypot(x, y), 0.0, 1.0)
     if magnitude <= 0.0:
@@ -315,14 +391,14 @@ def quantized_translation(left_x: float, left_y: float, speed_rpm: float) -> tup
     return forward_unit * scaled_rpm, strafe_unit * scaled_rpm
 
 
-def joystick_to_twist(joystick, speed_rpm: float) -> Twist:
+def joystick_to_twist(controller: ControllerState, speed_rpm: float) -> Twist:
     forward, strafe = quantized_translation(
-        get_axis(joystick, AXIS_LEFT_X),
-        get_axis(joystick, AXIS_LEFT_Y),
+        controller.centered_axis(controller.mapping.left_x),
+        controller.centered_axis(controller.mapping.left_y),
         speed_rpm,
     )
 
-    turn_axis = apply_deadzone(get_axis(joystick, AXIS_RIGHT_X))
+    turn_axis = apply_deadzone(controller.centered_axis(controller.mapping.right_x))
     if turn_axis == 0.0:
         turn = 0.0
     else:
@@ -419,9 +495,9 @@ def select_controller(pygame):
     return joystick
 
 
-def update_speed(speed_rpm: float, l2: TriggerAxis, r2: TriggerAxis, joystick, dt: float) -> float:
-    decrease = l2.value(get_axis(joystick, AXIS_LEFT_TRIGGER))
-    increase = r2.value(get_axis(joystick, AXIS_RIGHT_TRIGGER))
+def update_speed(speed_rpm: float, l2: TriggerAxis, r2: TriggerAxis, controller: ControllerState, dt: float) -> float:
+    decrease = l2.value(get_axis(controller.joystick, controller.mapping.left_trigger))
+    increase = r2.value(get_axis(controller.joystick, controller.mapping.right_trigger))
     delta = (increase - decrease) * SPEED_CHANGE_RPM_PER_S * dt
     return clamp(speed_rpm + delta, MIN_RPM, MAX_RPM)
 
@@ -446,10 +522,19 @@ def main() -> None:
 
     pygame.init()
     joystick = select_controller(pygame)
+    mapping = controller_mapping_for(joystick)
+    controller = ControllerState(joystick, mapping)
     print_controls()
+    print(
+        "controller | mapping "
+        f"lx={mapping.left_x} ly={mapping.left_y} "
+        f"rx={mapping.right_x} l2={mapping.left_trigger} r2={mapping.right_trigger} "
+        f"cross={mapping.button_cross} circle={mapping.button_circle} square={mapping.button_square} "
+        f"triangle={mapping.button_triangle} l1={mapping.button_l1} r1={mapping.button_r1}"
+    )
 
-    l2 = TriggerAxis(get_axis(joystick, AXIS_LEFT_TRIGGER))
-    r2 = TriggerAxis(get_axis(joystick, AXIS_RIGHT_TRIGGER))
+    l2 = TriggerAxis(get_axis(joystick, mapping.left_trigger))
+    r2 = TriggerAxis(get_axis(joystick, mapping.right_trigger))
     edges = ButtonEdges()
 
     link = EspPiControlLink(PORT, BAUD)
@@ -481,28 +566,28 @@ def main() -> None:
             dt = max(now_s - last_loop_s, 0.001)
             last_loop_s = now_s
 
-            speed_rpm = update_speed(speed_rpm, l2, r2, joystick, dt)
+            speed_rpm = update_speed(speed_rpm, l2, r2, controller, dt)
             if now_s - last_speed_print_s >= 1.0:
                 print(f"speed | {speed_rpm:.1f} rpm")
                 last_speed_print_s = now_s
 
-            if edges.pressed(joystick, BTN_TRIANGLE):
+            if edges.pressed(joystick, mapping.button_triangle):
                 print("imu | reinit")
                 initialize_robot(link)
 
-            if edges.pressed(joystick, BTN_L1):
+            if edges.pressed(joystick, mapping.button_l1):
                 actions.jog_stepper(STEPPER_UP_DIR)
 
-            if edges.pressed(joystick, BTN_R1):
+            if edges.pressed(joystick, mapping.button_r1):
                 actions.jog_stepper(STEPPER_DOWN_DIR)
 
-            if edges.pressed(joystick, BTN_SQUARE):
+            if edges.pressed(joystick, mapping.button_square):
                 actions.home_stepper()
 
-            if edges.pressed(joystick, BTN_CROSS):
+            if edges.pressed(joystick, mapping.button_cross):
                 actions.traffic_dance()
 
-            honking = get_button(joystick, BTN_CIRCLE)
+            honking = get_button(joystick, mapping.button_circle)
             if honking and honk_started_s is None:
                 honk_started_s = now_s
             if not honking:
@@ -520,7 +605,7 @@ def main() -> None:
             honk_allowed = honk_started_s is not None and now_s - honk_started_s <= BUZZER_HONK_MAX_S
             supervisor.indicators.set_buzzer(honk_allowed)
 
-            twist = joystick_to_twist(joystick, speed_rpm)
+            twist = joystick_to_twist(controller, speed_rpm)
             if twist.active():
                 if now_s - last_send_s >= TWIST_SEND_INTERVAL_S:
                     send_twist(link, twist)

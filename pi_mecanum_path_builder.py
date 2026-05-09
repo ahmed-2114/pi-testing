@@ -23,19 +23,19 @@ IR_BUZZER_ON_S = 1.0
 IR_RECHECK_DELAY_S = 3.0
 MIN_RESUME_DISTANCE_CM = 0.5
 
-# ESP MOVE angles are measured from forward. Positive angle is positive strafe.
-# If your physical right/left is reversed, swap R/L and the diagonal signs here.
+# ESP MOVE angles are measured from forward. This robot's physical strafe wiring
+# matches the older commander: left is positive strafe, right is negative strafe.
 DIRECTION_ORDER = ("F", "R", "L", "B", "BR", "BL", "FR", "FL")
 
 DIRECTION_ANGLES_DEG = {
     "F": 0.0,
-    "FR": 45.0,
-    "R": 90.0,
-    "BR": 135.0,
+    "FR": -45.0,
+    "R": -90.0,
+    "BR": -135.0,
     "B": 180.0,
-    "BL": -135.0,
-    "L": -90.0,
-    "FL": -45.0,
+    "BL": 135.0,
+    "L": 90.0,
+    "FL": 45.0,
 }
 
 STEPPER_DIRECTIONS = {
