@@ -80,7 +80,8 @@ DIR_PIN = 13
 EN_PIN = 5
 BUZZER_PIN = 19
 YELLOW_LED_PIN = 20
-RED_LED_PIN = 16
+GREEN_LED_PIN = 16
+RED_LED_PIN = 21
 STEP_HIGH_US = 10
 STEPPER_SPEED_SPS = 100.0
 STEPPER_DEFAULT_STEPS = 200
@@ -268,19 +269,7 @@ class StepperController:
         steps, direction = self.snapshot()
         return f"stepper | steps={steps} direction={direction} speed={STEPPER_SPEED_SPS:.1f} steps/s"
 
-    def run_configured(self, abort_event: threading.Event) -> bool:
-        steps, direction = self.snapshot()
-        return self.run_steps(steps, direction, abort_event)
-
-    def run_steps(self, steps: int, direction: int, abort_event: threading.Event) -> bool:
-        if steps <= 0:
-            print("stepper | skipped because configured steps=0")
-            return True
-
-        direction_sign = 1 if direction >= 0 else -1
-        interval_us = int(1_000_000.0 / STEPPER_SPEED_SPS)
-        interval_us = max(interval_us, STEP_HIGH_US + 50)
-
+    def _begin_motion(self, direction_sign: int) -> None:
         with self.lock:
             if direction_sign > 0:
                 self.dir_pin.on()
@@ -290,6 +279,28 @@ class StepperController:
 
         if self.on_motion_start is not None:
             self.on_motion_start()
+
+    def _end_motion(self) -> None:
+        self.step_pin.off()
+        self.en_pin.on()
+        if self.on_motion_end is not None:
+            self.on_motion_end()
+
+    def run_configured(self, abort_event: threading.Event) -> bool:
+        steps, direction = self.snapshot()
+        return self.run_steps(steps, direction, abort_event)
+
+    def run_steps(self, steps: int, direction: int, abort_event: threading.Event, *, announce: bool = True) -> bool:
+        if steps <= 0:
+            if announce:
+                print("stepper | skipped because configured steps=0")
+            return True
+
+        direction_sign = 1 if direction >= 0 else -1
+        interval_us = int(1_000_000.0 / STEPPER_SPEED_SPS)
+        interval_us = max(interval_us, STEP_HIGH_US + 50)
+
+        self._begin_motion(direction_sign)
 
         try:
             for step_index in range(steps):
@@ -302,19 +313,47 @@ class StepperController:
                 self.step_pin.off()
                 time.sleep(max((interval_us - STEP_HIGH_US) / 1_000_000.0, 0.0))
         finally:
-            self.step_pin.off()
-            self.en_pin.on()
-            if self.on_motion_end is not None:
-                self.on_motion_end()
+            self._end_motion()
 
-        print(f"stepper | completed steps={steps} direction={direction_sign}")
+        if announce:
+            print(f"stepper | completed steps={steps} direction={direction_sign}")
+        return True
+
+    def run_until_released(
+        self,
+        direction: int,
+        stop_event: threading.Event,
+        abort_event: threading.Event,
+    ) -> bool:
+        direction_sign = 1 if direction >= 0 else -1
+        interval_us = int(1_000_000.0 / STEPPER_SPEED_SPS)
+        interval_us = max(interval_us, STEP_HIGH_US + 50)
+
+        self._begin_motion(direction_sign)
+
+        try:
+            step_index = 0
+            while not stop_event.is_set():
+                if abort_event.is_set():
+                    print(f"stepper | aborted at step {step_index} because IR stop latched")
+                    return False
+
+                self.step_pin.on()
+                time.sleep(STEP_HIGH_US / 1_000_000.0)
+                self.step_pin.off()
+                time.sleep(max((interval_us - STEP_HIGH_US) / 1_000_000.0, 0.0))
+                step_index += 1
+        finally:
+            self._end_motion()
+
         return True
 
 
 class PiIndicators:
-    def __init__(self, yellow_pin: int, red_pin: int, buzzer_pin: int) -> None:
+    def __init__(self, yellow_pin: int, red_pin: int, green_pin: int, buzzer_pin: int) -> None:
         self.yellow = DigitalOutputDevice(yellow_pin, initial_value=False)
         self.red = DigitalOutputDevice(red_pin, initial_value=False)
+        self.green = DigitalOutputDevice(green_pin, initial_value=False)
         self.buzzer = DigitalOutputDevice(buzzer_pin, initial_value=False)
         self.lock = threading.Lock()
 
@@ -322,21 +361,35 @@ class PiIndicators:
         with self.lock:
             self.yellow.off()
             self.red.off()
+            self.green.off()
             self.buzzer.off()
 
-    def set_mecanum_active(self, active: bool) -> None:
+    def set_lights(self, *, yellow: bool | None = None, red: bool | None = None, green: bool | None = None) -> None:
         with self.lock:
-            if active:
-                self.yellow.on()
-            else:
-                self.yellow.off()
+            if yellow is not None:
+                if yellow:
+                    self.yellow.on()
+                else:
+                    self.yellow.off()
+            if red is not None:
+                if red:
+                    self.red.on()
+                else:
+                    self.red.off()
+            if green is not None:
+                if green:
+                    self.green.on()
+                else:
+                    self.green.off()
+
+    def set_mecanum_active(self, active: bool) -> None:
+        self.set_lights(yellow=active)
 
     def set_stepper_active(self, active: bool) -> None:
-        with self.lock:
-            if active:
-                self.red.on()
-            else:
-                self.red.off()
+        self.set_lights(red=active)
+
+    def set_green(self, active: bool) -> None:
+        self.set_lights(green=active)
 
     def set_buzzer(self, active: bool) -> None:
         with self.lock:
@@ -349,8 +402,26 @@ class PiIndicators:
         with self.lock:
             yellow = 1 if self.yellow.value else 0
             red = 1 if self.red.value else 0
+            green = 1 if self.green.value else 0
             buzzer = 1 if self.buzzer.value else 0
-        return f"indicators | yellow={yellow} red={red} buzzer={buzzer}"
+        return f"indicators | yellow={yellow} red={red} green={green} buzzer={buzzer}"
+
+
+class DisabledIRSafetyMonitor:
+    def close(self) -> None:
+        return
+
+    def clear_latch(self) -> bool:
+        return True
+
+    def snapshot(self) -> tuple[list[int], list[int], bool]:
+        return [], [], False
+
+    def active_sensors(self) -> list[int]:
+        return []
+
+    def status_text(self) -> str:
+        return "ir | disabled"
 
 
 class IRSafetyMonitor:
@@ -419,10 +490,11 @@ class IRSafetyMonitor:
 
 
 class MecanumIrStepperSupervisor:
-    def __init__(self, link: EspPiControlLink) -> None:
+    def __init__(self, link: EspPiControlLink, *, ir_enabled: bool = True) -> None:
         self.link = link
+        self.ir_enabled = ir_enabled
         self.ir_stop_latched = threading.Event()
-        self.indicators = PiIndicators(YELLOW_LED_PIN, RED_LED_PIN, BUZZER_PIN)
+        self.indicators = PiIndicators(YELLOW_LED_PIN, RED_LED_PIN, GREEN_LED_PIN, BUZZER_PIN)
         self.stepper = StepperController(
             STEP_PIN,
             DIR_PIN,
@@ -430,7 +502,10 @@ class MecanumIrStepperSupervisor:
             on_motion_start=self._on_stepper_start,
             on_motion_end=self._on_stepper_end,
         )
-        self.ir_monitor = IRSafetyMonitor(IR_PINS, self._on_ir_trigger)
+        if ir_enabled:
+            self.ir_monitor = IRSafetyMonitor(IR_PINS, self._on_ir_trigger)
+        else:
+            self.ir_monitor = DisabledIRSafetyMonitor()
 
     def close(self) -> None:
         self.ir_monitor.close()

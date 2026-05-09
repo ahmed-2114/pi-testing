@@ -31,6 +31,7 @@ SPEED_CHANGE_RPM_PER_S = 24.0
 
 STICK_DEADZONE = 0.18
 TRIGGER_DEADZONE = 0.08
+DPAD_AXIS_THRESHOLD = 0.5
 TWIST_SEND_INTERVAL_S = 0.08
 TWIST_TIMEOUT_MS = 300
 TELEOP_ACK_TIMEOUT_S = 0.20
@@ -49,6 +50,8 @@ AXIS_LEFT_Y = int(os.environ.get("PS_AXIS_LEFT_Y", "1"))
 AXIS_RIGHT_X = int(os.environ.get("PS_AXIS_RIGHT_X", "2"))
 AXIS_LEFT_TRIGGER = int(os.environ.get("PS_AXIS_L2", "4"))
 AXIS_RIGHT_TRIGGER = int(os.environ.get("PS_AXIS_R2", "5"))
+AXIS_DPAD_X = int(os.environ.get("PS_AXIS_DPAD_X", "6"))
+AXIS_DPAD_Y = int(os.environ.get("PS_AXIS_DPAD_Y", "7"))
 
 BTN_CROSS = int(os.environ.get("PS_BTN_CROSS", "0"))
 BTN_CIRCLE = int(os.environ.get("PS_BTN_CIRCLE", "1"))
@@ -66,6 +69,8 @@ JSIOCGBUTTONS = 0x80016A12
 LINUX_DUALSENSE_AXIS_RIGHT_X = int(os.environ.get("PS_LINUX_AXIS_RIGHT_X", "3"))
 LINUX_DUALSENSE_AXIS_LEFT_TRIGGER = int(os.environ.get("PS_LINUX_AXIS_L2", "2"))
 LINUX_DUALSENSE_AXIS_RIGHT_TRIGGER = int(os.environ.get("PS_LINUX_AXIS_R2", "5"))
+LINUX_DUALSENSE_AXIS_DPAD_X = int(os.environ.get("PS_LINUX_AXIS_DPAD_X", "6"))
+LINUX_DUALSENSE_AXIS_DPAD_Y = int(os.environ.get("PS_LINUX_AXIS_DPAD_Y", "7"))
 LINUX_DUALSENSE_BTN_L1 = int(os.environ.get("PS_LINUX_BTN_L1", "4"))
 LINUX_DUALSENSE_BTN_R1 = int(os.environ.get("PS_LINUX_BTN_R1", "5"))
 
@@ -95,6 +100,8 @@ class ControllerMapping:
     right_x: int
     left_trigger: int
     right_trigger: int
+    dpad_x: int
+    dpad_y: int
     button_cross: int
     button_circle: int
     button_square: int
@@ -221,15 +228,58 @@ class BackgroundActions:
         self.link = link
         self.supervisor = supervisor
         self.lock = threading.Lock()
+        self.stepper_hold_thread: threading.Thread | None = None
+        self.stepper_hold_stop: threading.Event | None = None
+        self.stepper_hold_direction: int | None = None
 
-    def jog_stepper(self, direction: int) -> None:
-        self._start_thread("stepper_jog", self._jog_stepper_worker, direction)
+    def close(self) -> None:
+        self.set_stepper_hold(None)
+
+    def set_stepper_hold(self, direction: int | None) -> None:
+        if direction == self.stepper_hold_direction and self.stepper_hold_thread is not None and self.stepper_hold_thread.is_alive():
+            return
+
+        self._stop_stepper_hold()
+        if direction is None:
+            return
+
+        if not self.lock.acquire(blocking=False):
+            return
+
+        stop_event = threading.Event()
+        self.stepper_hold_stop = stop_event
+        self.stepper_hold_direction = direction
+
+        def wrapped() -> None:
+            try:
+                self._stepper_hold_worker(direction, stop_event)
+            finally:
+                self.stepper_hold_direction = None
+                self.stepper_hold_stop = None
+                self.stepper_hold_thread = None
+                self.lock.release()
+
+        thread = threading.Thread(target=wrapped, name="stepper_hold", daemon=True)
+        self.stepper_hold_thread = thread
+        thread.start()
 
     def home_stepper(self) -> None:
+        self.set_stepper_hold(None)
         self._start_thread("stepper_home", self._home_stepper_worker)
 
     def traffic_dance(self) -> None:
         self._start_thread("traffic_dance", self._traffic_dance_worker)
+
+    def _stop_stepper_hold(self) -> None:
+        stop_event = self.stepper_hold_stop
+        thread = self.stepper_hold_thread
+        if stop_event is None or thread is None:
+            self.stepper_hold_direction = None
+            return
+
+        stop_event.set()
+        thread.join(timeout=0.5)
+        self.stepper_hold_direction = None
 
     def _start_thread(self, name: str, target, *args) -> None:
         if not self.lock.acquire(blocking=False):
@@ -245,14 +295,15 @@ class BackgroundActions:
         thread = threading.Thread(target=wrapped, name=name, daemon=True)
         thread.start()
 
-    def _jog_stepper_worker(self, direction: int) -> None:
+    def _stepper_hold_worker(self, direction: int, stop_event: threading.Event) -> None:
         text = "up" if direction < 0 else "down"
-        print(f"stepper | jog {text}")
-        self.supervisor.stepper.run_steps(
-            STEPPER_JOG_STEPS,
+        print(f"stepper | hold {text}")
+        self.supervisor.stepper.run_until_released(
             direction,
+            stop_event,
             self.supervisor.ir_stop_latched,
         )
+        print(f"stepper | hold {text} stopped")
 
     def _home_stepper_worker(self) -> None:
         print(f"home | checking ESP limit switch on GPIO {HOMING_LIMIT_PIN}")
@@ -281,7 +332,10 @@ class BackgroundActions:
 
     def _limit_pressed(self) -> bool:
         seq = self.link.send_command(f"LIMIT_STATUS pin={HOMING_LIMIT_PIN}")
-        data = self.link.wait_for(seq, {"ack", "limit"}, timeout=ACK_TIMEOUT_S)
+        try:
+            data = self.link.wait_for(seq, {"ack", "limit"}, timeout=ACK_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise RuntimeError("LIMIT_STATUS timed out. Check UART wiring/power and confirm the ESP sketch is running.") from exc
 
         if data.get("type") == "limit":
             return bool(data.get("pressed", False))
@@ -295,19 +349,18 @@ class BackgroundActions:
     def _traffic_dance_worker(self) -> None:
         print("traffic | dance")
         pattern = [
-            (True, False, 0.12),
-            (False, True, 0.12),
-            (True, True, 0.12),
-            (False, False, 0.10),
+            (False, False, True, 0.12),
+            (False, True, False, 0.12),
+            (True, False, False, 0.12),
+            (True, True, True, 0.12),
+            (False, False, False, 0.10),
         ]
         for _ in range(5):
-            for yellow, red, duration_s in pattern:
-                self.supervisor.indicators.set_mecanum_active(yellow)
-                self.supervisor.indicators.set_stepper_active(red)
+            for yellow, red, green, duration_s in pattern:
+                self.supervisor.indicators.set_lights(yellow=yellow, red=red, green=green)
                 time.sleep(duration_s)
 
-        self.supervisor.indicators.set_mecanum_active(False)
-        self.supervisor.indicators.set_stepper_active(False)
+        self.supervisor.indicators.set_lights(yellow=False, red=False, green=False)
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -334,6 +387,24 @@ def get_button(joystick, button_index: int) -> bool:
     return bool(joystick.get_button(button_index))
 
 
+def prompt_ir_enabled() -> bool:
+    while True:
+        raw = input("IR sensors included? (y/n): ").strip().lower()
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("input error | enter y or n")
+
+
+def axis_to_cardinal(value: float) -> int:
+    if value >= DPAD_AXIS_THRESHOLD:
+        return 1
+    if value <= -DPAD_AXIS_THRESHOLD:
+        return -1
+    return 0
+
+
 def controller_mapping_for(joystick) -> ControllerMapping:
     mapping = ControllerMapping(
         left_x=AXIS_LEFT_X,
@@ -341,6 +412,8 @@ def controller_mapping_for(joystick) -> ControllerMapping:
         right_x=AXIS_RIGHT_X,
         left_trigger=AXIS_LEFT_TRIGGER,
         right_trigger=AXIS_RIGHT_TRIGGER,
+        dpad_x=AXIS_DPAD_X,
+        dpad_y=AXIS_DPAD_Y,
         button_cross=BTN_CROSS,
         button_circle=BTN_CIRCLE,
         button_square=BTN_SQUARE,
@@ -356,6 +429,8 @@ def controller_mapping_for(joystick) -> ControllerMapping:
             right_x=LINUX_DUALSENSE_AXIS_RIGHT_X,
             left_trigger=LINUX_DUALSENSE_AXIS_LEFT_TRIGGER,
             right_trigger=LINUX_DUALSENSE_AXIS_RIGHT_TRIGGER,
+            dpad_x=LINUX_DUALSENSE_AXIS_DPAD_X,
+            dpad_y=LINUX_DUALSENSE_AXIS_DPAD_Y,
             button_cross=BTN_CROSS,
             button_circle=BTN_CIRCLE,
             button_square=BTN_SQUARE,
@@ -406,6 +481,25 @@ def joystick_to_twist(controller: ControllerState, speed_rpm: float) -> Twist:
 
     forward, strafe, turn = limit_combined_twist(forward, strafe, turn, speed_rpm)
     return Twist(forward, strafe, turn)
+
+
+def dpad_to_twist(controller: ControllerState, speed_rpm: float) -> Twist | None:
+    joystick = controller.joystick
+    if getattr(joystick, "uses_pygame", True) and hasattr(joystick, "get_numhats") and joystick.get_numhats() > 0:
+        dpad_x, dpad_y = joystick.get_hat(0)
+    else:
+        dpad_x = axis_to_cardinal(get_axis(joystick, controller.mapping.dpad_x))
+        dpad_y = -axis_to_cardinal(get_axis(joystick, controller.mapping.dpad_y))
+
+    if dpad_y > 0:
+        return Twist(speed_rpm, 0.0, 0.0)
+    if dpad_y < 0:
+        return Twist(-speed_rpm, 0.0, 0.0)
+    if dpad_x < 0:
+        return Twist(0.0, speed_rpm, 0.0)
+    if dpad_x > 0:
+        return Twist(0.0, -speed_rpm, 0.0)
+    return None
 
 
 def limit_combined_twist(forward: float, strafe: float, turn: float, max_rpm: float) -> tuple[float, float, float]:
@@ -505,9 +599,10 @@ def update_speed(speed_rpm: float, l2: TriggerAxis, r2: TriggerAxis, controller:
 def print_controls() -> None:
     print("controls")
     print("  left stick  | 8-way translate")
+    print("  d-pad       | cardinal translate override")
     print("  right stick | rotate")
     print("  R2/L2       | increase/decrease speed")
-    print("  L1/R1       | stepper up/down jog")
+    print("  L1/R1       | hold for stepper up/down, release to stop")
     print("  triangle    | reinit IMU")
     print("  circle      | honk")
     print("  square      | home stepper using ESP GPIO 23 limit command")
@@ -521,14 +616,16 @@ def main() -> None:
         raise SystemExit("pygame is required. Install it on the Pi with: sudo apt install python3-pygame") from exc
 
     pygame.init()
+    ir_enabled = prompt_ir_enabled()
     joystick = select_controller(pygame)
     mapping = controller_mapping_for(joystick)
     controller = ControllerState(joystick, mapping)
     print_controls()
+    print(f"IR mode | {'enabled' if ir_enabled else 'disabled'}")
     print(
         "controller | mapping "
         f"lx={mapping.left_x} ly={mapping.left_y} "
-        f"rx={mapping.right_x} l2={mapping.left_trigger} r2={mapping.right_trigger} "
+        f"rx={mapping.right_x} l2={mapping.left_trigger} r2={mapping.right_trigger} dpadx={mapping.dpad_x} dpady={mapping.dpad_y} "
         f"cross={mapping.button_cross} circle={mapping.button_circle} square={mapping.button_square} "
         f"triangle={mapping.button_triangle} l1={mapping.button_l1} r1={mapping.button_r1}"
     )
@@ -539,6 +636,7 @@ def main() -> None:
 
     link = EspPiControlLink(PORT, BAUD)
     supervisor: MecanumIrStepperSupervisor | None = None
+    actions: BackgroundActions | None = None
     speed_rpm = DEFAULT_RPM
     last_send_s = 0.0
     last_speed_print_s = 0.0
@@ -552,11 +650,14 @@ def main() -> None:
         data = request_status(link)
         print(telemetry_summary(data))
 
-        supervisor = MecanumIrStepperSupervisor(link)
+        supervisor = MecanumIrStepperSupervisor(link, ir_enabled=ir_enabled)
         actions = BackgroundActions(link, supervisor)
         print(supervisor.ir_monitor.status_text())
         print(supervisor.stepper.status_text())
-        print("IR note | startup baseline was captured when the script started, so begin with the path clear.")
+        if ir_enabled:
+            print("IR note | startup baseline was captured when the script started, so begin with the path clear.")
+        else:
+            print("IR note | disabled for this run")
 
         last_loop_s = time.time()
         while True:
@@ -575,11 +676,14 @@ def main() -> None:
                 print("imu | reinit")
                 initialize_robot(link)
 
-            if edges.pressed(joystick, mapping.button_l1):
-                actions.jog_stepper(STEPPER_UP_DIR)
-
-            if edges.pressed(joystick, mapping.button_r1):
-                actions.jog_stepper(STEPPER_DOWN_DIR)
+            l1_held = get_button(joystick, mapping.button_l1)
+            r1_held = get_button(joystick, mapping.button_r1)
+            if l1_held and not r1_held:
+                actions.set_stepper_hold(STEPPER_UP_DIR)
+            elif r1_held and not l1_held:
+                actions.set_stepper_hold(STEPPER_DOWN_DIR)
+            else:
+                actions.set_stepper_hold(None)
 
             if edges.pressed(joystick, mapping.button_square):
                 actions.home_stepper()
@@ -593,7 +697,7 @@ def main() -> None:
             if not honking:
                 honk_started_s = None
 
-            if supervisor.ir_stop_latched.is_set():
+            if ir_enabled and supervisor.ir_stop_latched.is_set():
                 if was_moving:
                     send_stop_no_throw(link)
                     was_moving = False
@@ -605,7 +709,9 @@ def main() -> None:
             honk_allowed = honk_started_s is not None and now_s - honk_started_s <= BUZZER_HONK_MAX_S
             supervisor.indicators.set_buzzer(honk_allowed)
 
-            twist = joystick_to_twist(controller, speed_rpm)
+            twist = dpad_to_twist(controller, speed_rpm)
+            if twist is None:
+                twist = joystick_to_twist(controller, speed_rpm)
             if twist.active():
                 if now_s - last_send_s >= TWIST_SEND_INTERVAL_S:
                     send_twist(link, twist)
@@ -621,6 +727,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nteleop | interrupted")
     finally:
+        if actions is not None:
+            actions.close()
         send_stop_no_throw(link)
         if supervisor is not None:
             supervisor.close()
