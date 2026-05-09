@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import threading
 import time
@@ -7,7 +8,9 @@ from dataclasses import dataclass
 import serial
 
 
-PORT = "/dev/serial0"
+# This Pi 5 Ubuntu setup exposes the header UART on /dev/ttyAMA0.
+# Override with PI_UART_PORT if your image uses a different device.
+PORT = os.environ.get("PI_UART_PORT", "/dev/ttyAMA0")
 BAUD = 115200
 READ_TIMEOUT = 0.1
 
@@ -37,6 +40,7 @@ class EspMecanumLink:
         self.events: queue.Queue[Event] = queue.Queue()
         self.stop_event = threading.Event()
         self.ser = serial.Serial(port=port, baudrate=baud, timeout=READ_TIMEOUT)
+        self.ser.reset_input_buffer()
         self.reader = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader.start()
 
@@ -67,6 +71,16 @@ class EspMecanumLink:
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
+                json_start = raw.find("{")
+                if json_start >= 0:
+                    candidate = raw[json_start:]
+                    try:
+                        data = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        self.events.put(Event(raw=raw, data=None))
+                    else:
+                        self.events.put(Event(raw=candidate, data=data))
+                    continue
                 self.events.put(Event(raw=raw, data=None))
                 continue
 
@@ -84,7 +98,7 @@ class EspMecanumLink:
         self.send(line)
         return seq
 
-    def wait_for(self, seq: int, wanted_types: set[str], timeout: float) -> dict:
+    def wait_for(self, seq: int | None, wanted_types: set[str], timeout: float, *, match_seq: bool = True) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = deadline - time.time()
@@ -98,11 +112,15 @@ class EspMecanumLink:
                 continue
 
             event_type = event.data.get("type")
+            seq_matches = (seq is None) or (event.data.get("seq") == seq)
+
             if event_type == "telemetry":
                 self._print_telemetry(event.data)
+                if event_type in wanted_types and (seq_matches or not match_seq):
+                    return event.data
                 continue
 
-            if event.data.get("seq") == seq and event_type in wanted_types:
+            if event_type in wanted_types and (seq_matches or not match_seq):
                 return event.data
 
             print(f"event: {event.raw}")
@@ -138,6 +156,15 @@ class EspMecanumLink:
             f"herr={move.get('headingErrorDeg', 0):>7}deg "
             f"rpm={rpm}"
         )
+
+
+def require_ok_ack(data: dict) -> None:
+    if data.get("ok", False):
+        return
+
+    cmd = data.get("cmd", "UNKNOWN")
+    message = data.get("message", "command rejected")
+    raise RuntimeError(f"{cmd} rejected: {message}")
 
 
 def move_cmd(angle: float, dist: float, speed: float, heading: float | None = None, timeout: int | None = None) -> str:
@@ -214,6 +241,7 @@ def execute_sequence(link: EspMecanumLink) -> None:
         seq = link.send_command(line)
         ack = link.wait_for(seq, {"ack"}, timeout=3.0)
         print(f"ack : {ack}")
+        require_ok_ack(ack)
         done = link.wait_for(seq, {"done"}, timeout=60.0)
         print(f"done: {done}")
 
@@ -256,7 +284,9 @@ def interactive_shell(link: EspMecanumLink) -> None:
             heading = float(parts[4]) if len(parts) >= 5 else None
             line = move_cmd(angle=angle, dist=dist, speed=speed, heading=heading)
             seq = link.send_command(line)
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             print(link.wait_for(seq, {"done"}, timeout=60.0))
             continue
 
@@ -267,7 +297,9 @@ def interactive_shell(link: EspMecanumLink) -> None:
             heading = float(parts[1])
             speed = float(parts[2]) if len(parts) >= 3 else 12.0
             seq = link.send_command(turn_cmd(heading, speed))
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             print(link.wait_for(seq, {"done"}, timeout=60.0))
             continue
 
@@ -276,28 +308,39 @@ def interactive_shell(link: EspMecanumLink) -> None:
                 print("usage: twist <forwardRpm> <strafeRpm> <turnRpm> <timeoutMs>")
                 continue
             seq = link.send_command(twist_cmd(float(parts[1]), float(parts[2]), float(parts[3]), int(parts[4])))
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             print(link.wait_for(seq, {"done"}, timeout=10.0))
             continue
 
         if cmd == "stop":
             seq = link.send_command("STOP")
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             continue
 
         if cmd == "zero_imu":
             seq = link.send_command("ZERO_IMU")
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             continue
 
         if cmd == "reset_enc":
             seq = link.send_command("RESET_ENC")
-            print(link.wait_for(seq, {"ack"}, timeout=3.0))
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
             continue
 
         if cmd == "status":
             seq = link.send_command("STATUS")
-            data = link.wait_for(seq, {"telemetry", "ack"}, timeout=3.0)
+            ack = link.wait_for(seq, {"ack"}, timeout=3.0)
+            print(ack)
+            require_ok_ack(ack)
+            data = link.wait_for(None, {"telemetry"}, timeout=3.0, match_seq=False)
             print(data)
             continue
 

@@ -2,6 +2,56 @@
 # 3 LED pattern tester for Raspberry Pi.
 # Terminal input/output replaces Arduino Serial Monitor.
 
+import importlib.util
+import os
+import sys
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+REEXEC_GUARD = "PI_TESTING_SYSTEM_PYTHON"
+
+
+def module_exists(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def reexec_target():
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0 and argv0 != "-" and os.path.exists(argv0):
+        return os.path.abspath(argv0)
+    return os.path.abspath(__file__)
+
+
+def ensure_gpiozero_runtime():
+    has_gpiozero = module_exists("gpiozero")
+    has_backend = any(module_exists(name) for name in ("lgpio", "RPi.GPIO", "pigpio"))
+    if has_gpiozero and has_backend:
+        return
+
+    if (
+        os.path.exists(SYSTEM_PYTHON)
+        and os.environ.get(REEXEC_GUARD) != "1"
+        and os.path.abspath(sys.executable) != SYSTEM_PYTHON
+    ):
+        os.environ[REEXEC_GUARD] = "1"
+        os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, reexec_target(), *sys.argv[1:]])
+
+    if not has_gpiozero:
+        raise SystemExit(
+            "gpiozero is not installed for this Python interpreter.\n"
+            f"Run this script with {SYSTEM_PYTHON} or install python3-gpiozero."
+        )
+
+    raise SystemExit(
+        "gpiozero is installed, but no supported GPIO pin backend is available for this Python interpreter.\n"
+        f"Run this script with {SYSTEM_PYTHON} or install lgpio/pigpio/RPi.GPIO for {sys.executable}."
+    )
+
+
+ensure_gpiozero_runtime()
+
 from gpiozero import DigitalOutputDevice
 import time
 import random
