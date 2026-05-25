@@ -71,13 +71,14 @@ sensors = [DigitalInputDevice(pin, pull_up=False) for pin in ir_pins]
 
 def main():
     print("6 IR sensor test started")
-    print("Format: IR1 IR2 IR3 IR4 IR5 IR6")
+    print("Format: FL Front FR right back left")
+    ir_names = ["FL", "Front", "FR", "right", "back", "left"]
     try:
         while True:
             parts = []
             for i in range(IR_COUNT):
                 reading = 1 if sensors[i].value else 0
-                parts.append(f"IR{i+1}={reading}")
+                parts.append(f"{ir_names[i]}={reading}")
             print("  ".join(parts), flush=True)
             time.sleep(0.2)
     except KeyboardInterrupt:
