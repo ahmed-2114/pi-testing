@@ -6,9 +6,9 @@ This is the real-life version of the simple-cardinal brain. It does not need
 ROS running on the Pi:
 
 - reads the 6 IR sensors directly from Raspberry Pi GPIO
-- receives odometry, IMU, encoder counts, wheel RPM, and PID telemetry from ESP32
+- receives odometry, IMU, encoder counts, and PID telemetry from ESP32
 - runs the simple-cardinal obstacle decision logic locally
-- sends body velocity RPM commands to the ESP32 wheel PID controller
+- sends position commands to the ESP32 position PID controller
 
 The matching ESP sketch is esp_pid.ino.
 """
@@ -33,6 +33,13 @@ PING_TIMEOUT_S = 2.5
 ACK_TIMEOUT_S = 3.0
 INIT_TIMEOUT_S = 8.0
 
+# These defaults mirror esp_pid.ino. Keep this block aligned with the sketch's
+# serial command layer and odometry configuration.
+ESP_DEFAULT_BAUD = 115200
+ESP_SERIAL_TELEMETRY_INTERVAL_S = 0.05
+ESP_SERIAL_COMMAND_TIMEOUT_S = 0.5
+ESP_POSITION_MOVE_TIMEOUT_S = 180.0
+
 IR_PINS = {
     "front_left": 23,
     "front": 24,
@@ -50,8 +57,8 @@ IR_LABELS = {
     "left": "Left",
 }
 
-LEFT = 1
-RIGHT = -1
+LEFT = -1
+RIGHT = 1
 
 
 @dataclass
@@ -234,21 +241,21 @@ class EspPiControlLink:
         self.send(line)
         return seq
 
-    def send_velocity(self, forward_rpm: float, strafe_rpm: float, rotate_rpm: float, args) -> None:
-        self.send(
-            "TWIST "
-            f"forward={forward_rpm:.3f} "
-            f"strafe={strafe_rpm:.3f} "
-            f"turn={rotate_rpm:.3f} "
-            f"timeout={max(100, int(args.telemetry_timeout * 1000))} "
-            f"strafeSign={args.esp_strafe_sign} "
-            f"rotateSign={args.esp_rotate_sign} "
-            f"odomForwardSign={args.esp_odom_forward_sign} "
-            f"odomStrafeSign={args.esp_odom_strafe_sign} "
-            f"odomYawSign={args.esp_odom_yaw_sign} "
-            f"odomForwardScale={args.esp_odom_forward_scale:.5f} "
-            f"odomStrafeScale={args.esp_odom_strafe_scale:.5f}"
+    def send_position_move(self, angle_deg: float, distance_m: float, heading_deg: float, timeout_s: float) -> int:
+        distance_cm = max(0.0, distance_m * 100.0)
+        return self.send_command(
+            "MOVE "
+            f"angle={angle_deg:.3f} "
+            f"dist={distance_cm:.3f} "
+            f"heading={heading_deg:.3f} "
+            f"timeout={int(timeout_s * 1000)}"
         )
+
+    def next_event(self, timeout: float) -> Event | None:
+        try:
+            return self.events.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def wait_for(self, seq: int | None, wanted_types: set[str], timeout: float) -> dict:
         deadline = time.monotonic() + timeout
@@ -290,68 +297,41 @@ class EspPiControlLink:
         raise TimeoutError("Timed out waiting for ESP telemetry")
 
 
-class EspPoseTracker:
+class PoseAccumulator:
     def __init__(self) -> None:
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
-        self.last_forward_m = None
-        self.last_strafe_m = None
 
-    def update(self, telemetry: dict) -> tuple[float, float, float]:
-        pose = telemetry.get("pose") or telemetry.get("odometry") or {}
-        imu = telemetry.get("imu") or {}
-        forward_m = 0.01 * float(pose.get("forwardCm", 0.0))
-        strafe_m = 0.01 * float(pose.get("strafeCm", 0.0))
-        yaw_deg = pose.get("yawDeg", imu.get("yawDeg", 0.0))
+    def pose(self) -> tuple[float, float, float]:
+        return self.x, self.y, self.yaw
+
+    def apply_body_delta(self, forward_m: float, strafe_m: float, yaw_deg: float) -> tuple[float, float, float]:
         yaw = math.radians(float(yaw_deg))
-
-        if self.last_forward_m is None:
-            self.last_forward_m = forward_m
-            self.last_strafe_m = strafe_m
-            self.yaw = yaw
-            return self.x, self.y, self.yaw
-
-        delta_forward = forward_m - self.last_forward_m
-        delta_strafe = strafe_m - self.last_strafe_m
-        self.last_forward_m = forward_m
-        self.last_strafe_m = strafe_m
-
         # Match the sim brain convention: physical forward is negative local X.
-        dx_body = -delta_forward
-        dy_body = -delta_strafe
+        dx_body = -float(forward_m)
+        dy_body = -float(strafe_m)
         self.x += dx_body * math.cos(yaw) - dy_body * math.sin(yaw)
         self.y += dx_body * math.sin(yaw) + dy_body * math.cos(yaw)
         self.yaw = yaw
-        return self.x, self.y, self.yaw
+        return self.pose()
 
-
-class DryRunPoseTracker(EspPoseTracker):
-    def __init__(self) -> None:
-        super().__init__()
-        self.last_time = None
-
-    def integrate(self, command: MotionCommand, now: float) -> tuple[float, float, float]:
-        if self.last_time is None:
-            self.last_time = now
-            return self.x, self.y, self.yaw
-        dt = max(0.0, min(0.2, now - self.last_time))
-        self.last_time = now
-        self.x += command.vx * dt
-        self.y += command.vy * dt
-        self.yaw += command.wz * dt
-        return self.x, self.y, self.yaw
+    def apply_done(self, done: dict) -> tuple[float, float, float]:
+        forward_m = 0.01 * float(done.get("forwardCm", 0.0))
+        strafe_m = 0.01 * float(done.get("strafeCm", 0.0))
+        yaw_deg = float(done.get("headingDeg", math.degrees(self.yaw)))
+        return self.apply_body_delta(forward_m, strafe_m, yaw_deg)
 
 
 class SimpleCardinalRealBrain:
     def __init__(self, args) -> None:
         self.goal_distance = args.goal_distance
         self.goal_tolerance = args.goal_tolerance
-        self.forward_speed = args.forward_speed
-        self.lateral_speed = args.lateral_speed
-        self.backoff_speed = args.backoff_speed
+        self.forward_weight = args.forward_weight
+        self.lateral_weight = args.lateral_weight
+        self.backoff_weight = args.backoff_weight
         self.line_kp = args.line_kp
-        self.max_line_correction_speed = args.max_line_correction_speed
+        self.max_line_correction_weight = args.max_line_correction_weight
         self.backoff_distance = args.backoff_distance
         self.post_front_clear_lateral_distance = args.post_front_clear_lateral_distance
         self.lateral_recovery_step = args.lateral_recovery_step
@@ -539,15 +519,15 @@ class SimpleCardinalRealBrain:
             return self.set_command(0.0, 0.0, 0.0)
 
         line_error = self.cross_track_error()
-        vy = clamp(-self.line_kp * line_error, -self.max_line_correction_speed, self.max_line_correction_speed)
-        return self.set_command(-self.forward_speed, vy, 0.0)
+        vy = clamp(-self.line_kp * line_error, -self.max_line_correction_weight, self.max_line_correction_weight)
+        return self.set_command(-self.forward_weight, vy, 0.0)
 
     def run_backoff(self) -> MotionCommand:
         backed_off = self.backoff_start_progress - self.along_track_progress()
         if backed_off >= self.backoff_distance:
             self.state = "SHIFT_OUT"
             return self.set_command(0.0, 0.0, 0.0)
-        return self.set_command(self.backoff_speed, 0.0, 0.0)
+        return self.set_command(self.backoff_weight, 0.0, 0.0)
 
     def run_shift_out(self) -> MotionCommand:
         line_error = self.cross_track_error()
@@ -563,7 +543,7 @@ class SimpleCardinalRealBrain:
         if self.front_blocked_any():
             self.front_clear_cross = None
             self.current_offset_target = line_error
-            vy = float(self.current_shift_direction) * self.lateral_speed
+            vy = float(self.current_shift_direction) * self.lateral_weight
             return self.set_command(0.0, vy, 0.0)
 
         if self.front_clear_cross is None:
@@ -574,7 +554,7 @@ class SimpleCardinalRealBrain:
             )
 
         offset_error = self.current_offset_target - line_error
-        vy = clamp(offset_error * 1.8, -self.lateral_speed, self.lateral_speed)
+        vy = clamp(offset_error * 1.8, -self.lateral_weight, self.lateral_weight)
         cmd = self.set_command(0.0, vy, 0.0)
 
         if abs(offset_error) <= self.shift_tolerance:
@@ -599,7 +579,7 @@ class SimpleCardinalRealBrain:
         elif self.side_seen_during_clear and self.side_clear_progress is None:
             self.side_clear_progress = progress
 
-        cmd = self.set_command(-self.forward_speed, 0.0, 0.0)
+        cmd = self.set_command(-self.forward_weight, 0.0, 0.0)
         if self.side_clear_progress is not None:
             if progress - self.side_clear_progress >= self.forward_clear_distance:
                 self.state = "RETURN_TO_PATH"
@@ -618,14 +598,14 @@ class SimpleCardinalRealBrain:
             self.state = "MOVE_TO_GOAL"
             return self.set_command(0.0, 0.0, 0.0)
 
-        return_direction = RIGHT if line_error > 0.0 else LEFT
+        return_direction = LEFT if line_error > 0.0 else RIGHT
         if self.side_blocked(return_direction):
             self.advance_start_progress = self.along_track_progress()
             self.side_clear_progress = self.along_track_progress()
             self.state = "ADVANCE_CLEAR"
             return self.set_command(0.0, 0.0, 0.0)
 
-        vy = clamp(-self.line_kp * line_error, -self.lateral_speed, self.lateral_speed)
+        vy = clamp(-self.line_kp * line_error, -self.lateral_weight, self.lateral_weight)
         return self.set_command(0.0, vy, 0.0)
 
     def step(self, now: float) -> MotionCommand:
@@ -655,48 +635,112 @@ class SimpleCardinalRealBrain:
         return self.set_command(0.0, 0.0, 0.0)
 
 
-def command_to_esp_rpm(command: MotionCommand, args) -> tuple[float, float, float]:
-    wheel_circumference_m = math.pi * args.wheel_diameter_m
-    linear_to_rpm = 60.0 / wheel_circumference_m
-    angular_to_rpm = ((args.wheel_base_half_m + args.track_width_half_m) / args.wheel_radius_m) * 60.0 / (2.0 * math.pi)
+def command_to_position_step(command: MotionCommand, brain: SimpleCardinalRealBrain, args) -> tuple[float, float] | None:
+    forward_component = -command.vx
+    strafe_component = command.vy
+    magnitude = math.hypot(forward_component, strafe_component)
+    if magnitude <= 1e-6:
+        return None
 
-    forward_rpm = args.forward_command_sign * (-command.vx * linear_to_rpm)
-    strafe_rpm = args.strafe_command_sign * (command.vy * linear_to_rpm)
-    rotate_rpm = args.rotate_command_sign * (command.wz * angular_to_rpm)
+    angle_deg = math.degrees(math.atan2(strafe_component, forward_component))
+    distance_m = args.position_step
 
-    if args.normalize_to_rpm_limit:
-        max_abs = max(abs(forward_rpm), abs(strafe_rpm), abs(rotate_rpm))
-        if max_abs > 1e-6:
-            scale = args.rpm_limit / max_abs
-            forward_rpm *= scale
-            strafe_rpm *= scale
-            rotate_rpm *= scale
+    forward_fraction = forward_component / magnitude
+    if brain.state == "MOVE_TO_GOAL" and forward_fraction > 0.001:
+        remaining = max(0.0, brain.goal_distance - brain.along_track_progress())
+        distance_m = min(distance_m, remaining / forward_fraction)
 
-    return (
-        clamp(forward_rpm, -args.rpm_limit, args.rpm_limit),
-        clamp(strafe_rpm, -args.rpm_limit, args.rpm_limit),
-        clamp(rotate_rpm, -args.rpm_limit, args.rpm_limit),
-    )
+    if distance_m < args.min_position_step:
+        return None
+    return angle_deg, distance_m
+
+
+def simulated_done(angle_deg: float, distance_m: float, heading_deg: float) -> dict:
+    angle_rad = math.radians(angle_deg)
+    return {
+        "type": "done",
+        "result": "completed",
+        "forwardCm": math.cos(angle_rad) * distance_m * 100.0,
+        "strafeCm": math.sin(angle_rad) * distance_m * 100.0,
+        "headingDeg": heading_deg,
+    }
+
+
+def wait_for_move_done_or_ir(
+    link: EspPiControlLink,
+    seq: int,
+    ir_bank: GpioIrBank,
+    timeout_s: float,
+    watch_front_ir: bool,
+) -> dict:
+    deadline = time.monotonic() + timeout_s
+    stop_sent = False
+
+    while time.monotonic() < deadline:
+        ir_state = ir_bank.read()
+        if (
+            watch_front_ir
+            and (ir_state.get("front") or ir_state.get("front_left") or ir_state.get("front_right"))
+            and not stop_sent
+        ):
+            link.send_command("STOP")
+            stop_sent = True
+
+        event = link.next_event(0.02)
+        if event is None or event.data is None:
+            continue
+
+        data = event.data
+        if data.get("type") == "done" and data.get("seq") == seq:
+            return data
+
+    if not stop_sent:
+        link.send_command("STOP")
+    raise TimeoutError(f"Timed out waiting for MOVE seq={seq}")
+
+
+def execute_position_step(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    angle_deg: float,
+    distance_m: float,
+    args,
+    watch_front_ir: bool,
+) -> dict:
+    if args.dry_run:
+        done = simulated_done(angle_deg, distance_m, args.heading)
+        pose_tracker.apply_done(done)
+        time.sleep(args.dry_run_step_delay)
+        return done
+
+    seq = link.send_position_move(angle_deg, distance_m, args.heading, args.move_timeout)
+    ack = link.wait_for(seq, {"ack"}, timeout=ACK_TIMEOUT_S)
+    if not ack.get("ok", False):
+        raise RuntimeError(f"MOVE rejected: {ack.get('message', 'no message')}")
+
+    done = wait_for_move_done_or_ir(link, seq, ir_bank, args.move_timeout, watch_front_ir)
+    pose_tracker.apply_done(done)
+    return done
 
 
 def ir_summary(ir_state: dict[str, bool]) -> str:
     return " ".join(f"{IR_LABELS[name]}={1 if ir_state.get(name, False) else 0}" for name in IR_PINS)
 
 
-def short_list(values, digits=1) -> str:
-    if not values:
-        return "[]"
-    return "[" + ",".join(f"{float(value):.{digits}f}" for value in values[:4]) + "]"
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Pi master: simple-cardinal brain + GPIO IR + ESP UART PID link.")
 
     parser.add_argument("--port", default=os.environ.get("PI_UART_PORT", "/dev/ttyAMA0"))
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--period", type=float, default=0.05)
+    parser.add_argument("--baud", type=int, default=ESP_DEFAULT_BAUD)
+    parser.add_argument("--period", type=float, default=ESP_SERIAL_TELEMETRY_INTERVAL_S)
     parser.add_argument("--status-period", type=float, default=0.5)
-    parser.add_argument("--telemetry-timeout", type=float, default=0.5)
+    parser.add_argument("--telemetry-timeout", type=float, default=ESP_SERIAL_COMMAND_TIMEOUT_S)
+    parser.add_argument("--move-timeout", type=float, default=ESP_POSITION_MOVE_TIMEOUT_S)
+    parser.add_argument("--position-step", type=float, default=0.05)
+    parser.add_argument("--min-position-step", type=float, default=0.005)
+    parser.add_argument("--heading", type=float, default=0.0)
+    parser.add_argument("--dry-run-step-delay", type=float, default=0.02)
     parser.add_argument("--auto-start", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--mock-ir", action="store_true")
@@ -706,13 +750,9 @@ def parse_args():
     parser.add_argument("--reset-encoders-on-start", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--init-imu-on-start", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--goal-distance", type=float, default=3.55)
+    parser.add_argument("--goal-distance", type=float, default=1.20)
     parser.add_argument("--goal-tolerance", type=float, default=0.05)
-    parser.add_argument("--forward-speed", type=float, default=None)
-    parser.add_argument("--lateral-speed", type=float, default=None)
-    parser.add_argument("--backoff-speed", type=float, default=None)
     parser.add_argument("--line-kp", type=float, default=1.6)
-    parser.add_argument("--max-line-correction-speed", type=float, default=None)
     parser.add_argument("--backoff-distance", type=float, default=0.0)
     parser.add_argument("--post-front-clear-lateral-distance", type=float, default=0.25)
     parser.add_argument("--lateral-recovery-step", type=float, default=0.05)
@@ -725,37 +765,23 @@ def parse_args():
     parser.add_argument("--preferred-first-direction", choices=("left", "right"), default="right")
     parser.add_argument("--max-shift-cycles", type=int, default=12)
 
-    parser.add_argument("--wheel-diameter-m", type=float, default=0.097)
-    parser.add_argument("--wheel-radius-m", type=float, default=0.0485)
-    parser.add_argument("--wheel-base-half-m", type=float, default=0.09)
-    parser.add_argument("--track-width-half-m", type=float, default=0.1574)
-    parser.add_argument("--rpm-limit", type=float, default=60.0)
-    parser.add_argument("--normalize-to-rpm-limit", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--forward-command-sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--strafe-command-sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--rotate-command-sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--esp-strafe-sign", type=int, choices=(-1, 1), default=-1)
-    parser.add_argument("--esp-rotate-sign", type=int, choices=(-1, 1), default=-1)
-    parser.add_argument("--esp-odom-forward-sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--esp-odom-strafe-sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--esp-odom-yaw-sign", type=int, choices=(-1, 1), default=-1)
-    parser.add_argument("--esp-odom-forward-scale", type=float, default=0.9854)
-    parser.add_argument("--esp-odom-strafe-scale", type=float, default=0.9375)
-
     args = parser.parse_args()
-    max_linear_speed = math.pi * args.wheel_diameter_m * args.rpm_limit / 60.0
-    if args.forward_speed is None:
-        args.forward_speed = max_linear_speed
-    if args.lateral_speed is None:
-        args.lateral_speed = max_linear_speed
-    if args.backoff_speed is None:
-        args.backoff_speed = max_linear_speed
-    if args.max_line_correction_speed is None:
-        args.max_line_correction_speed = max_linear_speed
+    args.forward_weight = 1.0
+    args.lateral_weight = 1.0
+    args.backoff_weight = 1.0
+    args.max_line_correction_weight = 1.0
     if args.period <= 0.0:
         parser.error("--period must be greater than zero")
     if args.status_period <= 0.0:
         parser.error("--status-period must be greater than zero")
+    if args.telemetry_timeout <= 0.0:
+        parser.error("--telemetry-timeout must be greater than zero")
+    if args.move_timeout <= 0.0:
+        parser.error("--move-timeout must be greater than zero")
+    if args.position_step <= 0.0:
+        parser.error("--position-step must be greater than zero")
+    if args.min_position_step <= 0.0:
+        parser.error("--min-position-step must be greater than zero")
     return args
 
 
@@ -784,8 +810,7 @@ def main() -> None:
     ir_bank = GpioIrBank(active_low=args.active_low, pull_up=args.pull_up, mock=args.mock_ir or args.dry_run)
     brain = SimpleCardinalRealBrain(args)
     link = None
-    pose_tracker = DryRunPoseTracker() if args.dry_run else EspPoseTracker()
-    command = MotionCommand()
+    pose_tracker = PoseAccumulator()
 
     try:
         if not args.dry_run:
@@ -799,60 +824,37 @@ def main() -> None:
             input()
             enabled = True
 
-        print("Pi brain running. ESP is low-level PID; Pi is high-level decision maker.", flush=True)
-        next_tick = time.monotonic()
+        print("Pi brain running. ESP owns position PID; Pi sends only position steps.", flush=True)
         last_status = 0.0
         last_error = 0.0
+        last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
 
         while True:
             now = time.monotonic()
-            if now < next_tick:
-                time.sleep(next_tick - now)
-            next_tick += args.period
-            now = time.monotonic()
 
             try:
-                if args.dry_run:
-                    x, y, yaw = pose_tracker.integrate(command, now)
-                    telemetry = {"pose": {"forwardCm": -x * 100.0, "strafeCm": -y * 100.0, "yawDeg": math.degrees(yaw)}}
-                    telemetry_stamp = now
-                else:
-                    telemetry, telemetry_stamp = link.latest_telemetry()
-                    if telemetry is None or now - telemetry_stamp > args.telemetry_timeout:
-                        raise TimeoutError("ESP telemetry is stale")
-                    x, y, yaw = pose_tracker.update(telemetry)
-
+                x, y, yaw = pose_tracker.pose()
                 ir_state = ir_bank.read()
                 brain.update_pose(x, y, yaw, now)
                 brain.update_ir(ir_state, now)
                 brain.set_enabled(enabled)
                 command = brain.step(now)
-                forward_rpm, strafe_rpm, rotate_rpm = command_to_esp_rpm(command, args)
-
-                if not args.dry_run:
-                    link.send_velocity(forward_rpm, strafe_rpm, rotate_rpm, args)
 
                 if now - last_status >= args.status_period:
-                    pose = telemetry.get("pose") or telemetry.get("odometry") or {}
-                    imu = telemetry.get("imu") or {}
                     print(
                         "state={state} progress={progress:.3f}/{goal:.3f} cross={cross:.3f} "
-                        "cmd_rpm(f={f:.1f},s={s:.1f},r={r:.1f}) "
-                        "pose_cm(f={pf:.1f},s={ps:.1f},yaw={py:.1f}) "
-                        "imu_yaw={iy:.1f} rpm={rpm} enc={enc} ir[{ir}]".format(
+                        "last_move={result} d_cm(f={df:.1f},s={ds:.1f},yaw={dy:.1f}) "
+                        "pose_xy=({x:.3f},{y:.3f}) ir[{ir}]".format(
                             state=brain.state,
                             progress=brain.along_track_progress(),
                             goal=brain.goal_distance,
                             cross=brain.cross_track_error(),
-                            f=forward_rpm,
-                            s=strafe_rpm,
-                            r=rotate_rpm,
-                            pf=float(pose.get("forwardCm", 0.0)),
-                            ps=float(pose.get("strafeCm", 0.0)),
-                            py=float(pose.get("yawDeg", imu.get("yawDeg", 0.0))),
-                            iy=float(imu.get("yawDeg", 0.0)),
-                            rpm=short_list(telemetry.get("rpm", [])),
-                            enc=telemetry.get("signedEncoderCounts", telemetry.get("encoderCounts", [])),
+                            result=last_done.get("result", "none"),
+                            df=float(last_done.get("forwardCm", 0.0)),
+                            ds=float(last_done.get("strafeCm", 0.0)),
+                            dy=float(last_done.get("headingDeg", math.degrees(yaw))),
+                            x=x,
+                            y=y,
                             ir=ir_summary(ir_state),
                         ),
                         flush=True,
@@ -864,6 +866,24 @@ def main() -> None:
                         link.command_ack("STOP")
                     print("Goal reached; ESP stopped.", flush=True)
                     break
+
+                step = command_to_position_step(command, brain, args)
+                if step is None:
+                    time.sleep(args.period)
+                    continue
+
+                angle_deg, distance_m = step
+                angle_rad = math.radians(angle_deg)
+                watch_front_ir = math.cos(angle_rad) > 0.2
+                last_done = execute_position_step(
+                    link,
+                    pose_tracker,
+                    ir_bank,
+                    angle_deg,
+                    distance_m,
+                    args,
+                    watch_front_ir,
+                )
 
             except Exception as exc:
                 if now - last_error >= 1.0:
