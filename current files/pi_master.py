@@ -14,6 +14,8 @@ The matching ESP sketch is esp_pid.ino.
 """
 
 import argparse
+import csv
+import datetime as dt
 import importlib.util
 import json
 import math
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 
 SYSTEM_PYTHON = "/usr/bin/python3"
@@ -40,10 +43,10 @@ ESP_SERIAL_TELEMETRY_INTERVAL_S = 0.05
 ESP_SERIAL_COMMAND_TIMEOUT_S = 0.5
 ESP_POSITION_MOVE_TIMEOUT_S = 180.0
 
+IR_SENSOR_ORDER = ("front_left", "front", "front_right", "right", "back", "left")
 IR_PINS = {
     "front_left": 23,
     "front": 24,
-    "front_right": 25,
     "right": 17,
     "back": 27,
     "left": 22,
@@ -60,6 +63,18 @@ IR_LABELS = {
 LEFT = -1
 RIGHT = 1
 
+DIRECTION_ORDER = ("F", "R", "L", "B", "FR", "FL", "BR", "BL")
+DIRECTION_ANGLES_DEG = {
+    "F": 0.0,
+    "FR": -45.0,
+    "R": -90.0,
+    "BR": -135.0,
+    "B": 180.0,
+    "BL": 135.0,
+    "L": 90.0,
+    "FL": 45.0,
+}
+
 
 @dataclass
 class Event:
@@ -72,6 +87,96 @@ class MotionCommand:
     vx: float = 0.0
     vy: float = 0.0
     wz: float = 0.0
+
+
+class RunLogger:
+    def __init__(self, mode: str, root: str = "run_logs") -> None:
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.dir = Path(root) / f"{stamp}_{mode}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.events_path = self.dir / "events.jsonl"
+        self.moves_path = self.dir / "moves.csv"
+        self._event_file = self.events_path.open("a", encoding="utf-8")
+        self._move_file = self.moves_path.open("a", newline="", encoding="utf-8")
+        self._move_writer = csv.DictWriter(
+            self._move_file,
+            fieldnames=[
+                "time",
+                "label",
+                "angle_deg",
+                "distance_m",
+                "watch",
+                "result",
+                "forward_cm",
+                "strafe_cm",
+                "heading_deg",
+                "ir",
+            ],
+        )
+        self._move_writer.writeheader()
+        self._move_file.flush()
+
+    def close(self) -> None:
+        self._event_file.close()
+        self._move_file.close()
+
+    def event(self, kind: str, **data) -> None:
+        payload = {
+            "time": dt.datetime.now().isoformat(timespec="milliseconds"),
+            "kind": kind,
+            **data,
+        }
+        self._event_file.write(json.dumps(payload, sort_keys=True) + "\n")
+        self._event_file.flush()
+
+    def move(self, label: str, angle_deg: float, distance_m: float, watch_sensors: set[str], done: dict) -> None:
+        row = {
+            "time": dt.datetime.now().isoformat(timespec="milliseconds"),
+            "label": label,
+            "angle_deg": f"{angle_deg:.3f}",
+            "distance_m": f"{distance_m:.4f}",
+            "watch": " ".join(sorted(watch_sensors)),
+            "result": done.get("result", ""),
+            "forward_cm": f"{float(done.get('forwardCm', 0.0)):.2f}",
+            "strafe_cm": f"{float(done.get('strafeCm', 0.0)):.2f}",
+            "heading_deg": f"{float(done.get('headingDeg', 0.0)):.2f}",
+            "ir": " ".join(done.get("ir", [])),
+        }
+        self._move_writer.writerow(row)
+        self._move_file.flush()
+
+
+class NullLogger:
+    dir = None
+
+    def close(self) -> None:
+        pass
+
+    def event(self, kind: str, **data) -> None:
+        pass
+
+    def move(self, label: str, angle_deg: float, distance_m: float, watch_sensors: set[str], done: dict) -> None:
+        pass
+
+
+class IrEdgeTracker:
+    def __init__(self) -> None:
+        self.previous: dict[str, bool] | None = None
+
+    def update(self, state: dict[str, bool]) -> tuple[list[str], list[str]]:
+        if self.previous is None:
+            self.previous = dict(state)
+            return [], []
+        rising = sorted(name for name, active in state.items() if active and not self.previous.get(name, False))
+        falling = sorted(name for name, active in state.items() if not active and self.previous.get(name, False))
+        self.previous = dict(state)
+        return rising, falling
+
+
+def log_event(args, kind: str, **data) -> None:
+    logger = getattr(args, "logger", None)
+    if logger is not None:
+        logger.event(kind, **data)
 
 
 def clamp(value, low, high):
@@ -134,29 +239,58 @@ def ensure_serial_runtime() -> None:
 
 
 class GpioIrBank:
-    def __init__(self, *, active_low: bool, pull_up: bool, mock: bool) -> None:
+    def __init__(self, *, active_low: bool, pull_up: bool, mock: bool, logic: str = "baseline") -> None:
         self.active_low = active_low
         self.mock = mock
+        self.logic = logic
         self.devices = {}
+        self.baseline_raw = {}
         if mock:
             return
-
         ensure_gpiozero_runtime()
         from gpiozero import DigitalInputDevice
 
-        self.devices = {
-            name: DigitalInputDevice(pin, pull_up=pull_up, active_state=True)
-            for name, pin in IR_PINS.items()
-        }
+        try:
+            self.devices = {name: DigitalInputDevice(pin, pull_up=pull_up) for name, pin in IR_PINS.items()}
+            time.sleep(0.05)
+            for name, device in self.devices.items():
+                self.baseline_raw[name] = bool(device.value)
+            print(
+                f"gpio | IR logic={self.logic} baseline "
+                + " ".join(f"{IR_LABELS[name]}={1 if value else 0}" for name, value in self.baseline_raw.items())
+                + " FR=NA",
+                flush=True,
+            )
+        except Exception as e:
+            # If the GPIO pins cannot be claimed (e.g. 'GPIO busy'), fall back to mock
+            # mode so the Pi can still run mission logic and talk to the ESP.
+            print(f"warn | GPIO initialization failed, falling back to mock IR: {e}", flush=True)
+            # Clean up any partially-created devices
+            try:
+                for device in self.devices.values():
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.devices = {}
+            self.baseline_raw = {name: False for name in IR_PINS}
+            self.mock = True
 
     def read(self) -> dict[str, bool]:
         if self.mock:
-            return {name: False for name in IR_PINS}
+            return {name: False for name in IR_SENSOR_ORDER}
 
-        state = {}
+        state = {name: False for name in IR_SENSOR_ORDER}
         for name, device in self.devices.items():
             raw_high = bool(device.value)
-            state[name] = (not raw_high) if self.active_low else raw_high
+            if self.logic == "active-low":
+                state[name] = not raw_high
+            elif self.logic == "active-high":
+                state[name] = raw_high
+            else:
+                state[name] = raw_high != self.baseline_raw.get(name, raw_high)
         return state
 
     def close(self) -> None:
@@ -165,14 +299,16 @@ class GpioIrBank:
 
 
 class EspPiControlLink:
-    def __init__(self, port: str, baud: int) -> None:
+    def __init__(self, port: str, baud: int, *, verbose_serial: bool = False) -> None:
         ensure_serial_runtime()
         import serial
 
         self.port = port
         self.baud = baud
+        self.verbose_serial = verbose_serial
         self.seq = 1
         self.events: queue.Queue[Event] = queue.Queue()
+        self.pending_events: list[Event] = []
         self.stop_event = threading.Event()
         self.send_lock = threading.Lock()
         self.telemetry_lock = threading.Lock()
@@ -202,7 +338,20 @@ class EspPiControlLink:
             if not raw:
                 continue
 
+            if self.verbose_serial:
+                try:
+                    print(f"rcv_raw | {raw}", flush=True)
+                except Exception:
+                    pass
+
             data = self._parse_json_line(raw)
+            if data is None:
+                # Non-JSON line received; keep it visible for debugging.
+                if self.verbose_serial:
+                    try:
+                        print(f"parse_fail | raw={raw}", flush=True)
+                    except Exception:
+                        pass
             if data is not None and data.get("type") == "telemetry":
                 with self.telemetry_lock:
                     self.last_telemetry = data
@@ -252,14 +401,33 @@ class EspPiControlLink:
         )
 
     def next_event(self, timeout: float) -> Event | None:
+        if self.pending_events:
+            return self.pending_events.pop(0)
         try:
             return self.events.get(timeout=timeout)
         except queue.Empty:
             return None
 
+    def drain_events(self) -> None:
+        self.pending_events.clear()
+        while True:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                return
+
     def wait_for(self, seq: int | None, wanted_types: set[str], timeout: float) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            for index, event in enumerate(list(self.pending_events)):
+                if event.data is None:
+                    continue
+                data = event.data
+                seq_matches = seq is None or data.get("seq") == seq
+                if data.get("type") in wanted_types and seq_matches:
+                    self.pending_events.pop(index)
+                    return data
+
             remaining = deadline - time.monotonic()
             try:
                 event = self.events.get(timeout=max(0.02, remaining))
@@ -273,6 +441,7 @@ class EspPiControlLink:
             seq_matches = seq is None or data.get("seq") == seq
             if data.get("type") in wanted_types and seq_matches:
                 return data
+            self.pending_events.append(event)
 
         raise TimeoutError(f"Timed out waiting for {wanted_types} for seq {seq}")
 
@@ -322,6 +491,50 @@ class PoseAccumulator:
         yaw_deg = float(done.get("headingDeg", math.degrees(self.yaw)))
         return self.apply_body_delta(forward_m, strafe_m, yaw_deg)
 
+    def set_from_telemetry(self, telemetry: dict) -> tuple[float, float, float]:
+        pose = telemetry.get("pose") or telemetry.get("odometry") or {}
+        imu = telemetry.get("imu") or {}
+        forward_m = 0.01 * float(pose.get("forwardCm", 0.0))
+        strafe_m = 0.01 * float(pose.get("strafeCm", 0.0))
+        yaw_deg = float(pose.get("yawDeg", imu.get("yawDeg", math.degrees(self.yaw))))
+        self.x = -forward_m
+        self.y = -strafe_m
+        self.yaw = math.radians(yaw_deg)
+        return self.pose()
+
+
+@dataclass
+class MissionMemory:
+    forward_m: float = 0.0
+    lateral_m: float = 0.0
+
+    def record_completed_move(self, angle_deg: float, distance_m: float, done: dict) -> None:
+        if done.get("result") == "ir_stop":
+            return
+
+        angle_rad = math.radians(angle_deg)
+        command_forward_m = math.cos(angle_rad) * distance_m
+        command_lateral_m = math.sin(angle_rad) * distance_m
+
+        if abs(command_forward_m) >= abs(command_lateral_m):
+            reported_forward_m = 0.01 * float(done.get("forwardCm", command_forward_m * 100.0))
+            if abs(reported_forward_m) < 1e-6:
+                reported_forward_m = command_forward_m
+            self.forward_m = max(0.0, self.forward_m + reported_forward_m)
+        else:
+            self.lateral_m += command_lateral_m
+
+    def sync_forward_from_brain(self, brain: "SimpleCardinalRealBrain") -> None:
+        self.forward_m = max(0.0, brain.along_track_progress())
+
+    def sync_from_brain(self, brain: "SimpleCardinalRealBrain") -> None:
+        self.forward_m = max(0.0, brain.along_track_progress())
+        self.lateral_m = brain.cross_track_error()
+
+    def snap_center_if_close(self, tolerance_m: float) -> None:
+        if abs(self.lateral_m) <= tolerance_m:
+            self.lateral_m = 0.0
+
 
 class SimpleCardinalRealBrain:
     def __init__(self, args) -> None:
@@ -344,8 +557,8 @@ class SimpleCardinalRealBrain:
         self.max_shift_cycles = args.max_shift_cycles
 
         self.preferred_direction = RIGHT if args.preferred_first_direction != "left" else LEFT
-        self.sensor_hits = {name: False for name in IR_PINS}
-        self.sensor_update_sec = {name: None for name in IR_PINS}
+        self.sensor_hits = {name: False for name in IR_SENSOR_ORDER}
+        self.sensor_update_sec = {name: None for name in IR_SENSOR_ORDER}
 
         self.current_x = None
         self.current_y = None
@@ -401,12 +614,15 @@ class SimpleCardinalRealBrain:
         return self.current_yaw if self.current_yaw is not None else 0.0
 
     def sensor_active(self, sensor_name: str) -> bool:
+        # Gracefully handle sensors that may be absent from the mapping
+        if sensor_name not in self.sensor_update_sec:
+            return False
         stamp = self.sensor_update_sec[sensor_name]
         if stamp is None:
             return False
         if self._now - stamp > self.sensor_timeout_sec:
             return False
-        return self.sensor_hits[sensor_name]
+        return bool(self.sensor_hits.get(sensor_name, False))
 
     def forward_blocked(self) -> bool:
         return self.sensor_active("front")
@@ -463,9 +679,9 @@ class SimpleCardinalRealBrain:
             return RIGHT
         if trigger == "front_right":
             return LEFT
-        if self.front_left_blocked() and not self.front_right_blocked():
+        if self.front_left_blocked():
             return RIGHT
-        if self.front_right_blocked() and not self.front_left_blocked():
+        if self.front_right_blocked():
             return LEFT
         return self.preferred_direction
 
@@ -666,25 +882,80 @@ def simulated_done(angle_deg: float, distance_m: float, heading_deg: float) -> d
     }
 
 
+def done_from_latest_telemetry(link: EspPiControlLink, seq: int, result: str, ir: list[str] | None = None) -> dict:
+    telemetry, _stamp = link.latest_telemetry()
+    pose = (telemetry or {}).get("pose") or {}
+    imu = (telemetry or {}).get("imu") or {}
+    return {
+        "type": "done",
+        "seq": seq,
+        "result": result,
+        "ir": ir or [],
+        "forwardCm": float(pose.get("forwardCm", 0.0)),
+        "strafeCm": float(pose.get("strafeCm", 0.0)),
+        "headingDeg": float(pose.get("yawDeg", imu.get("yawDeg", 0.0))),
+    }
+
+
+def stop_active_move(
+    link: EspPiControlLink,
+    active_seq: int,
+    *,
+    result: str,
+    ir: list[str] | None = None,
+    done_timeout_s: float = 1.5,
+) -> dict:
+    stop_seq = link.send_command("STOP")
+    try:
+        link.wait_for(stop_seq, {"ack"}, timeout=ACK_TIMEOUT_S)
+    except TimeoutError as exc:
+        print(f"warn | STOP ack timeout: {exc}", flush=True)
+
+    try:
+        done = link.wait_for(active_seq, {"done"}, timeout=done_timeout_s)
+    except TimeoutError:
+        done = done_from_latest_telemetry(link, active_seq, result, ir)
+    else:
+        done = dict(done)
+        done["result"] = result
+        done["ir"] = ir or done.get("ir", [])
+    return done
+
+
 def wait_for_move_done_or_ir(
     link: EspPiControlLink,
     seq: int,
     ir_bank: GpioIrBank,
     timeout_s: float,
-    watch_front_ir: bool,
+    watch_sensors: set[str],
+    *,
+    require_fresh_edge: bool = False,
+    timeout_returns_done: bool = False,
 ) -> dict:
     deadline = time.monotonic() + timeout_s
-    stop_sent = False
+    armed = {name: True for name in watch_sensors}
+    if require_fresh_edge and watch_sensors:
+        initial_state = ir_bank.read()
+        armed = {name: not initial_state.get(name, False) for name in watch_sensors}
+        initially_active = sorted(name for name in watch_sensors if initial_state.get(name, False))
+        if initially_active:
+            print(f"watch | waiting for {initially_active} to clear before accepting edge", flush=True)
 
     while time.monotonic() < deadline:
         ir_state = ir_bank.read()
-        if (
-            watch_front_ir
-            and (ir_state.get("front") or ir_state.get("front_left") or ir_state.get("front_right"))
-            and not stop_sent
-        ):
-            link.send_command("STOP")
-            stop_sent = True
+        if require_fresh_edge:
+            active = []
+            for name in watch_sensors:
+                is_active = ir_state.get(name, False)
+                if not is_active:
+                    armed[name] = True
+                elif armed.get(name, True):
+                    active.append(name)
+        else:
+            active = sorted(name for name in watch_sensors if ir_state.get(name, False))
+        if active:
+            print(f"ir_stop | active={active} state={ir_summary(ir_state)}", flush=True)
+            return stop_active_move(link, seq, result="ir_stop", ir=active)
 
         event = link.next_event(0.02)
         if event is None or event.data is None:
@@ -694,8 +965,10 @@ def wait_for_move_done_or_ir(
         if data.get("type") == "done" and data.get("seq") == seq:
             return data
 
-    if not stop_sent:
-        link.send_command("STOP")
+    stopped = stop_active_move(link, seq, result="timeout_stop", ir=[])
+    if timeout_returns_done:
+        print(f"timeout_stop | seq={seq} after {timeout_s:.2f}s", flush=True)
+        return stopped
     raise TimeoutError(f"Timed out waiting for MOVE seq={seq}")
 
 
@@ -707,6 +980,10 @@ def execute_position_step(
     distance_m: float,
     args,
     watch_front_ir: bool,
+    watch_sensors: set[str] | None = None,
+    require_fresh_edge: bool = False,
+    move_timeout_s: float | None = None,
+    timeout_returns_done: bool = False,
 ) -> dict:
     if args.dry_run:
         done = simulated_done(angle_deg, distance_m, args.heading)
@@ -714,23 +991,1113 @@ def execute_position_step(
         time.sleep(args.dry_run_step_delay)
         return done
 
-    seq = link.send_position_move(angle_deg, distance_m, args.heading, args.move_timeout)
+    if watch_sensors is None:
+        watch_sensors = {"front", "front_left", "front_right"} if watch_front_ir else set()
+    timeout_s = args.move_timeout if move_timeout_s is None else max(0.05, float(move_timeout_s))
+    link.drain_events()
+
+    print(
+        f"send_move | angle={angle_deg:.3f} dist={distance_m:.3f}m heading={args.heading:.3f} "
+        f"watch={sorted(watch_sensors)} timeout={timeout_s:.2f}s",
+        flush=True,
+    )
+
+    seq = link.send_position_move(angle_deg, distance_m, args.heading, timeout_s)
+    print(f"sent seq={seq}", flush=True)
+
     ack = link.wait_for(seq, {"ack"}, timeout=ACK_TIMEOUT_S)
+    print(f"ack | {ack}", flush=True)
     if not ack.get("ok", False):
         raise RuntimeError(f"MOVE rejected: {ack.get('message', 'no message')}")
 
-    done = wait_for_move_done_or_ir(link, seq, ir_bank, args.move_timeout, watch_front_ir)
-    pose_tracker.apply_done(done)
+    done = wait_for_move_done_or_ir(
+        link,
+        seq,
+        ir_bank,
+        timeout_s,
+        watch_sensors,
+        require_fresh_edge=require_fresh_edge,
+        timeout_returns_done=timeout_returns_done,
+    )
+    print(f"done | {done}", flush=True)
     return done
 
 
+FRONT_WATCH_SENSORS = {"front", "front_left", "front_right"}
+SIDE_WATCH_SENSORS = {"left", "right"}
+ALL_WATCH_SENSORS = FRONT_WATCH_SENSORS | SIDE_WATCH_SENSORS
+
+
+def is_connected_sensor(sensor_name: str) -> bool:
+    return sensor_name in IR_PINS
+
+
+def connected_sensors(sensor_names) -> set[str]:
+    return {name for name in sensor_names if is_connected_sensor(name)}
+
+
+def direction_to_angle(direction: int) -> float:
+    return 90.0 if direction == LEFT else -90.0
+
+
+def direction_name(direction: int) -> str:
+    return "left" if direction == LEFT else "right"
+
+
+def side_sensor_for_direction(direction: int) -> str:
+    return "left" if direction == LEFT else "right"
+
+
+def front_corner_sensor_after_strafe(direction: int) -> str:
+    return "front_right" if direction == LEFT else "front_left"
+
+
+def side_sensor_after_front_avoidance(direction: int) -> str:
+    return side_sensor_for_direction(opposite_direction(direction))
+
+
+def refresh_pose_from_telemetry(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    timeout_s: float,
+    min_stamp: float = 0.0,
+) -> bool:
+    if link is None:
+        return False
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        telemetry, stamp = link.latest_telemetry()
+        if telemetry is not None and stamp >= min_stamp:
+            pose_tracker.set_from_telemetry(telemetry)
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def update_brain_from_pose(
+    brain: SimpleCardinalRealBrain,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    enabled: bool,
+) -> dict[str, bool]:
+    now = time.monotonic()
+    x, y, yaw = pose_tracker.pose()
+    ir_state = ir_bank.read()
+    brain.update_pose(x, y, yaw, now)
+    brain.update_ir(ir_state, now)
+    brain.set_enabled(enabled)
+    return ir_state
+
+
+def print_mission_status(
+    brain: SimpleCardinalRealBrain,
+    pose_tracker: PoseAccumulator,
+    ir_state: dict[str, bool],
+    last_done: dict,
+    mission: MissionMemory | None = None,
+) -> None:
+    x, y, yaw = pose_tracker.pose()
+    progress = mission.forward_m if mission is not None else brain.along_track_progress()
+    cross = mission.lateral_m if mission is not None else brain.cross_track_error()
+    print(
+        "state={state} progress={progress:.3f}/{goal:.3f} cross={cross:.3f} "
+        "last_move={result} d_cm(f={df:.1f},s={ds:.1f},yaw={dy:.1f}) "
+        "pose_xy=({x:.3f},{y:.3f}) ir[{ir}]".format(
+            state=brain.state,
+            progress=progress,
+            goal=brain.goal_distance,
+            cross=cross,
+            result=last_done.get("result", "none"),
+            df=float(last_done.get("forwardCm", 0.0)),
+            ds=float(last_done.get("strafeCm", 0.0)),
+            dy=float(last_done.get("headingDeg", math.degrees(yaw))),
+            x=x,
+            y=y,
+            ir=ir_summary(ir_state),
+        ),
+        flush=True,
+    )
+
+
+def choose_front_avoidance(ir_state: dict[str, bool], brain: SimpleCardinalRealBrain, args) -> tuple[int, float, str]:
+    front = bool(ir_state.get("front", False))
+    front_left = bool(ir_state.get("front_left", False))
+    front_right = bool(ir_state.get("front_right", False))
+
+    if front:
+        if front_left and not front_right:
+            return RIGHT, args.front_strafe_distance, "front+front_left"
+        if front_right and not front_left:
+            return LEFT, args.front_strafe_distance, "front+front_right"
+        return RIGHT, args.front_strafe_distance, "front"
+
+    if front_left:
+        return RIGHT, args.front_corner_strafe_distance, "front_left"
+    if front_right:
+        return LEFT, args.front_corner_strafe_distance, "front_right"
+    return brain.preferred_direction, args.front_strafe_distance, "front"
+
+
+def side_escape_direction(active_sensors: list[str]) -> int:
+    if "left" in active_sensors:
+        return RIGHT
+    return LEFT
+
+
+def execute_segment(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    label: str,
+    angle_deg: float,
+    distance_m: float,
+    watch_sensors: set[str],
+    mission: MissionMemory | None = None,
+    require_fresh_edge: bool = False,
+    move_timeout_s: float | None = None,
+    timeout_returns_done: bool = False,
+) -> dict:
+    distance_m = max(0.0, float(distance_m))
+    print(f"path | {label} angle={angle_deg:.1f} dist_cm={distance_m * 100.0:.1f}", flush=True)
+    move_started = time.monotonic()
+    done = execute_position_step(
+        link,
+        pose_tracker,
+        ir_bank,
+        angle_deg,
+        distance_m,
+        args,
+        False,
+        watch_sensors,
+        require_fresh_edge=require_fresh_edge,
+        move_timeout_s=move_timeout_s,
+        timeout_returns_done=timeout_returns_done,
+    )
+    fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+    if link is not None and not fresh_pose:
+        pose_tracker.set_from_telemetry({"pose": done, "imu": {"yawDeg": done.get("headingDeg", args.heading)}})
+    update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+    if mission is not None:
+        if done.get("result") == "ir_stop":
+            mission.sync_from_brain(brain)
+        else:
+            mission.record_completed_move(angle_deg, distance_m, done)
+            mission.sync_from_brain(brain)
+            mission.snap_center_if_close(args.rejoin_tolerance)
+    logger = getattr(args, "logger", None)
+    if logger is not None:
+        logger.move(label, angle_deg, distance_m, watch_sensors, done)
+    return done
+
+
+def execute_front_trigger_forward_buffer(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    mission: MissionMemory,
+) -> dict:
+    target_m = args.front_trigger_forward_buffer_distance
+    start_forward_m = mission.forward_m
+    last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
+
+    for attempt in range(args.front_trigger_forward_buffer_attempts):
+        completed_m = max(0.0, mission.forward_m - start_forward_m)
+        remaining_m = target_m - completed_m
+        if remaining_m <= args.front_trigger_forward_buffer_tolerance:
+            return last_done
+
+        label = "front sensitivity forward buffer"
+        if attempt:
+            label = f"front sensitivity forward buffer retry {attempt + 1}"
+        last_done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            label,
+            0.0,
+            remaining_m,
+            set(),
+            mission,
+            move_timeout_s=args.front_trigger_forward_buffer_timeout,
+            timeout_returns_done=True,
+        )
+        if last_done.get("result") == "ir_stop":
+            return last_done
+        if last_done.get("result") == "timeout_stop":
+            return last_done
+
+    completed_m = max(0.0, mission.forward_m - start_forward_m)
+    if completed_m + args.front_trigger_forward_buffer_tolerance < target_m:
+        print(
+            f"warn | front sensitivity buffer reported {completed_m * 100.0:.1f}cm "
+            f"of requested {target_m * 100.0:.1f}cm",
+            flush=True,
+        )
+    return last_done
+
+
+def execute_front_search_strafe(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    direction: int,
+    mission: MissionMemory,
+) -> tuple[dict, int, str]:
+    for attempt in range(2):
+        corner_sensor = front_corner_sensor_after_strafe(direction)
+        side_block_sensor = side_sensor_for_direction(direction)
+        corner_watch = connected_sensors({corner_sensor})
+        side_block_watch = connected_sensors({side_block_sensor})
+
+        if not corner_watch:
+            print(
+                f"warn | {corner_sensor} is not connected; using short fallback strafe "
+                f"{args.front_corner_strafe_distance * 100.0:.1f}cm",
+                flush=True,
+            )
+            done = execute_segment(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                f"front avoidance {direction_name(direction)} fallback strafe",
+                direction_to_angle(direction),
+                args.front_corner_strafe_distance,
+                side_block_watch,
+                mission,
+                move_timeout_s=args.front_corner_buffer_timeout,
+                timeout_returns_done=True,
+            )
+            return done, direction, corner_sensor
+
+        watch = corner_watch | side_block_watch
+        done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            f"front avoidance search strafe {direction_name(direction)}",
+            direction_to_angle(direction),
+            args.front_strafe_search_distance,
+            watch,
+            mission,
+            move_timeout_s=args.front_strafe_search_timeout,
+        )
+
+        active = set(done.get("ir", []))
+        if done.get("result") == "ir_stop" and side_block_sensor in active:
+            next_direction = opposite_direction(direction)
+            print(
+                f"avoid | {side_block_sensor} blocked while strafing {direction_name(direction)}; "
+                f"switching {direction_name(next_direction)}",
+                flush=True,
+            )
+            direction = next_direction
+            continue
+        if done.get("result") == "ir_stop" and corner_sensor in active:
+            return done, direction, corner_sensor
+        return done, direction, corner_sensor
+
+    raise RuntimeError("Both strafe directions were blocked during front avoidance")
+
+
+def execute_strafe_until_corner_falling(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    direction: int,
+    corner_sensor: str,
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    if not is_connected_sensor(corner_sensor):
+        print(f"warn | {corner_sensor} falling edge unavailable; skipping diagonal falling wait", flush=True)
+        return {"result": "corner_falling_unavailable", "ir": [corner_sensor], "forwardCm": 0.0, "strafeCm": 0.0}
+
+    initial_state = ir_bank.read()
+    if not initial_state.get(corner_sensor, False):
+        print(f"edge | {corner_sensor}=0 already clear", flush=True)
+        return {"result": "corner_already_clear", "ir": [corner_sensor], "forwardCm": 0.0, "strafeCm": 0.0}
+
+    if args.dry_run:
+        done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            f"strafe until {corner_sensor} falling",
+            direction_to_angle(direction),
+            args.front_corner_buffer_distance,
+            set(),
+            mission,
+        )
+        done["result"] = "corner_falling"
+        done["ir"] = [corner_sensor]
+        return done
+
+    side_block_sensor = side_sensor_for_direction(direction)
+    print(
+        f"path | strafe {direction_name(direction)} until {corner_sensor} falling edge",
+        flush=True,
+    )
+    move_started = time.monotonic()
+    seq = link.send_position_move(
+        direction_to_angle(direction),
+        args.front_strafe_search_distance,
+        args.heading,
+        args.front_strafe_search_timeout,
+    )
+    print(f"sent seq={seq}", flush=True)
+    ack = link.wait_for(seq, {"ack"}, timeout=ACK_TIMEOUT_S)
+    print(f"ack | {ack}", flush=True)
+    if not ack.get("ok", False):
+        raise RuntimeError(f"MOVE rejected: {ack.get('message', 'no message')}")
+
+    deadline = time.monotonic() + args.front_strafe_search_timeout
+    previous_active = True
+    while time.monotonic() < deadline:
+        ir_state = ir_bank.read()
+        if ir_state.get(side_block_sensor, False):
+            done = stop_active_move(link, seq, result="ir_stop", ir=[side_block_sensor])
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": done, "imu": {"yawDeg": done.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            logger = getattr(args, "logger", None)
+            if logger is not None:
+                logger.move(f"strafe until {corner_sensor} falling", direction_to_angle(direction), args.front_strafe_search_distance, {side_block_sensor, corner_sensor}, done)
+            return done
+
+        active = bool(ir_state.get(corner_sensor, False))
+        if previous_active and not active:
+            done = stop_active_move(link, seq, result="corner_falling", ir=[corner_sensor])
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": done, "imu": {"yawDeg": done.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            print(f"edge | {corner_sensor}=0 falling edge", flush=True)
+            logger = getattr(args, "logger", None)
+            if logger is not None:
+                logger.move(f"strafe until {corner_sensor} falling", direction_to_angle(direction), args.front_strafe_search_distance, {side_block_sensor, corner_sensor}, done)
+            return done
+        previous_active = active
+
+        event = link.next_event(0.02)
+        if event is None or event.data is None:
+            continue
+        data = event.data
+        if data.get("type") == "done" and data.get("seq") == seq:
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": data, "imu": {"yawDeg": data.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            raise RuntimeError(f"{corner_sensor} did not produce a falling edge before the strafe search limit")
+
+    stop_active_move(link, seq, result="timeout_stop", ir=[])
+    raise TimeoutError(f"Timed out waiting for {corner_sensor} falling edge")
+
+
+def execute_forward_until_side_falling(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    side_sensor: str,
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    if args.dry_run:
+        done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            f"forward until {side_sensor} clears",
+            0.0,
+            args.side_follow_dry_distance,
+            set(),
+            mission,
+        )
+        done["result"] = "side_falling"
+        done["ir"] = [side_sensor]
+        return done
+
+    print(
+        f"path | forward until {side_sensor} rising+falling edge "
+        f"max_cm={args.side_follow_search_distance * 100.0:.1f}",
+        flush=True,
+    )
+    move_started = time.monotonic()
+    seq = link.send_position_move(0.0, args.side_follow_search_distance, args.heading, args.move_timeout)
+    print(f"sent seq={seq}", flush=True)
+    ack = link.wait_for(seq, {"ack"}, timeout=ACK_TIMEOUT_S)
+    print(f"ack | {ack}", flush=True)
+    if not ack.get("ok", False):
+        raise RuntimeError(f"MOVE rejected: {ack.get('message', 'no message')}")
+
+    deadline = time.monotonic() + args.move_timeout
+    initial_state = ir_bank.read()
+    seen_active = bool(initial_state.get(side_sensor, False))
+    previous_active = seen_active
+    if seen_active:
+        print(f"edge | {side_sensor}=1 at forward start; waiting for falling edge", flush=True)
+
+    while time.monotonic() < deadline:
+        ir_state = ir_bank.read()
+        front_watch = FRONT_WATCH_SENSORS if args.side_follow_watch_front else set()
+        front_hits = sorted(name for name in front_watch if ir_state.get(name, False))
+        if front_hits:
+            done = stop_active_move(link, seq, result="ir_stop", ir=front_hits)
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": done, "imu": {"yawDeg": done.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            return done
+
+        active = bool(ir_state.get(side_sensor, False))
+        if active and not seen_active:
+            seen_active = True
+            print(f"edge | {side_sensor}=1 rising edge", flush=True)
+        if seen_active and previous_active and not active:
+            done = stop_active_move(link, seq, result="side_falling", ir=[side_sensor])
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": done, "imu": {"yawDeg": done.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            print(f"edge | {side_sensor}=0 falling edge", flush=True)
+            return done
+        previous_active = active
+
+        event = link.next_event(0.02)
+        if event is None or event.data is None:
+            continue
+        data = event.data
+        if data.get("type") == "done" and data.get("seq") == seq:
+            fresh_pose = refresh_pose_from_telemetry(link, pose_tracker, args.telemetry_timeout, move_started)
+            if not fresh_pose:
+                pose_tracker.set_from_telemetry({"pose": data, "imu": {"yawDeg": data.get("headingDeg", args.heading)}})
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            mission.sync_from_brain(brain)
+            raise RuntimeError(f"{side_sensor} IR did not produce a falling edge before the forward search limit")
+
+    stop_active_move(link, seq, result="timeout_stop", ir=[])
+    raise TimeoutError(f"Timed out waiting for {side_sensor} falling edge")
+
+
+def execute_side_escape(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    active_sensors: list[str],
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    action_budget[0] -= 1
+    if action_budget[0] < 0:
+        raise RuntimeError("Too many avoidance actions; stopping mission")
+
+    direction = side_escape_direction(active_sensors)
+    angle = direction_to_angle(direction)
+    print(
+        f"avoid | side={active_sensors} escape={direction_name(direction)} "
+        f"{args.side_escape_distance * 100.0:.1f}cm",
+        flush=True,
+    )
+    done = execute_segment(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        "side escape strafe",
+        angle,
+        args.side_escape_distance,
+        set(),
+        mission,
+    )
+    if done.get("result") == "ir_stop":
+        return done
+
+    done = execute_segment(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        "side escape forward",
+        0.0,
+        args.side_escape_forward_distance,
+        ALL_WATCH_SENSORS,
+        mission,
+    )
+    return done
+
+
+def execute_recenter(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
+    for _ in range(args.max_recenter_attempts):
+        update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+        offset = mission.lateral_m
+        if abs(offset) <= args.rejoin_tolerance:
+            mission.lateral_m = 0.0
+            print("path | centered on original line", flush=True)
+            return last_done
+
+        direction = LEFT if offset > 0.0 else RIGHT
+        done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            "return to center",
+            direction_to_angle(direction),
+            abs(offset),
+            {side_sensor_for_direction(direction)},
+            mission,
+        )
+        last_done = done
+        if done.get("result") == "ir_stop":
+            side_done = execute_side_escape(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                done.get("ir", []),
+                action_budget,
+                mission,
+            )
+            last_done = side_done
+            if side_done.get("result") == "ir_stop":
+                continue
+    raise RuntimeError("Could not return to the original center line")
+
+
+def execute_front_avoidance(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    ir_state: dict[str, bool],
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    action_budget[0] -= 1
+    if action_budget[0] < 0:
+        raise RuntimeError("Too many avoidance actions; stopping mission")
+
+    direction, _strafe_distance, reason = choose_front_avoidance(ir_state, brain, args)
+    if ir_state.get(side_sensor_for_direction(direction), False):
+        direction = opposite_direction(direction)
+        print(f"avoid | preferred side blocked; switching {direction_name(direction)}", flush=True)
+    corner_sensor = front_corner_sensor_after_strafe(direction)
+    side_sensor = side_sensor_after_front_avoidance(direction)
+    print(
+        f"avoid | {reason}: forward buffer {args.front_trigger_forward_buffer_distance * 100.0:.1f}cm, "
+        f"then strafe {direction_name(direction)} until {corner_sensor} rising/falling, "
+        f"then follow {side_sensor} falling edge and advance {args.front_advance_distance * 100.0:.1f}cm",
+        flush=True,
+    )
+
+    if any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS):
+        done = execute_front_trigger_forward_buffer(link, pose_tracker, ir_bank, brain, args, mission)
+        if done.get("result") == "ir_stop":
+            return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+
+    done, direction, corner_sensor = execute_front_search_strafe(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        direction,
+        mission,
+    )
+    side_sensor = side_sensor_after_front_avoidance(direction)
+    if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
+        return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+    if done.get("result") not in ("ir_stop", "timeout_stop", "completed"):
+        raise RuntimeError("Front avoidance corner IR was not detected before strafe search limit")
+
+    done = execute_strafe_until_corner_falling(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        direction,
+        corner_sensor,
+        action_budget,
+        mission,
+    )
+    if done.get("result") == "ir_stop":
+        active = done.get("ir", [])
+        if side_sensor_for_direction(direction) in active:
+            return execute_front_avoidance(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                {"front": True, side_sensor_for_direction(direction): True},
+                action_budget,
+                mission,
+            )
+        return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, active, action_budget, mission)
+
+    done = execute_forward_until_side_falling(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        side_sensor,
+        action_budget,
+        mission,
+    )
+    if done.get("result") == "ir_stop":
+        return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+
+    done = execute_segment(
+        link,
+        pose_tracker,
+        ir_bank,
+        brain,
+        args,
+        "side clear forward buffer",
+        0.0,
+        args.front_advance_distance,
+        ALL_WATCH_SENSORS,
+        mission,
+        move_timeout_s=args.front_advance_timeout,
+        timeout_returns_done=True,
+    )
+    if done.get("result") == "ir_stop":
+        return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+
+    return execute_recenter(link, pose_tracker, ir_bank, brain, args, action_budget, mission)
+
+
+def handle_ir_stop(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    active_sensors: list[str],
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    ir_state = {name: False for name in IR_SENSOR_ORDER}
+    for name in active_sensors:
+        ir_state[name] = True
+
+    if any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS):
+        return execute_front_avoidance(link, pose_tracker, ir_bank, brain, args, ir_state, action_budget, mission)
+    if any(ir_state.get(name, False) for name in SIDE_WATCH_SENSORS):
+        done = execute_side_escape(link, pose_tracker, ir_bank, brain, args, active_sensors, action_budget, mission)
+        if done.get("result") == "ir_stop":
+            return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+        return done
+    return {"result": "ignored_ir", "ir": active_sensors}
+
+
+def execute_goal_correction(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+    action_budget: list[int],
+    mission: MissionMemory,
+) -> dict:
+    last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
+    for _ in range(args.max_goal_correction_attempts):
+        overshoot = mission.forward_m - brain.goal_distance
+        if overshoot <= args.goal_tolerance:
+            return last_done
+        print(f"path | back to 120cm mark dist_cm={overshoot * 100.0:.1f}", flush=True)
+        last_done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            "back to goal mark",
+            180.0,
+            overshoot,
+            {"back"},
+            mission,
+        )
+        if last_done.get("result") == "ir_stop":
+            return handle_ir_stop(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                last_done.get("ir", []),
+                action_budget,
+                mission,
+            )
+    raise RuntimeError("Could not correct back to the 120cm goal mark")
+
+
+def run_segment_mission(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+) -> None:
+    last_status = 0.0
+    last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
+    action_budget = [args.max_avoidance_actions]
+    mission = MissionMemory()
+
+    update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+    brain.state = "MOVE_TO_GOAL"
+
+    # Send one initial full MOVE toward the goal (counts as the mission's
+    # first commanded motion). This ensures the first command is a single
+    # MOVE covering the full `goal_distance` (e.g., 1.20 m / 120 cm).
+    try:
+        print(f"path | initial mission forward dist_cm={brain.goal_distance * 100.0:.1f}", flush=True)
+        initial_done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            "initial mission forward",
+            0.0,
+            brain.goal_distance,
+            FRONT_WATCH_SENSORS,
+            mission,
+        )
+        if initial_done.get("result") == "ir_stop":
+            # Handle the obstacle and continue the mission loop
+            initial_done = handle_ir_stop(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                initial_done.get("ir", []),
+                action_budget,
+                mission,
+            )
+        last_done = initial_done
+    except Exception as exc:
+        print(f"error | initial move failed: {exc}", flush=True)
+        raise
+
+    while True:
+        ir_state = update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+        now = time.monotonic()
+        if now - last_status >= args.status_period:
+            print_mission_status(brain, pose_tracker, ir_state, last_done, mission)
+            last_status = now
+
+        remaining = brain.goal_distance - mission.forward_m
+        if remaining <= 0.0:
+            last_done = execute_goal_correction(link, pose_tracker, ir_bank, brain, args, action_budget, mission)
+            execute_recenter(link, pose_tracker, ir_bank, brain, args, action_budget, mission)
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            if abs(mission.forward_m - brain.goal_distance) <= args.goal_tolerance and abs(mission.lateral_m) <= args.rejoin_tolerance:
+                brain.state = "DONE"
+                if link is not None:
+                    link.command_ack("STOP")
+                print("Goal reached; ESP stopped.", flush=True)
+                return
+
+        move_distance = max(0.0, remaining)
+        if move_distance < args.min_position_step:
+            move_distance = args.min_position_step
+
+        last_done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            "mission forward",
+            0.0,
+            move_distance,
+            FRONT_WATCH_SENSORS,
+            mission,
+        )
+        if last_done.get("result") == "ir_stop":
+            last_done = handle_ir_stop(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                last_done.get("ir", []),
+                action_budget,
+                mission,
+            )
+
+
+def parse_manual_waypoint(raw: str, default_heading_deg: float) -> tuple[str, float, float, float]:
+    parts = raw.split()
+    if len(parts) not in (2, 3):
+        raise ValueError("use: <direction> <distance_cm> [heading_deg]")
+    direction = parts[0].upper()
+    if direction not in DIRECTION_ANGLES_DEG:
+        raise ValueError(f"direction must be one of: {' '.join(DIRECTION_ORDER)}")
+    distance_cm = float(parts[1])
+    if distance_cm <= 0.0:
+        raise ValueError("distance must be greater than zero")
+    heading = float(parts[2]) if len(parts) == 3 else default_heading_deg
+    return direction, DIRECTION_ANGLES_DEG[direction], distance_cm / 100.0, heading
+
+
+def run_move_mode(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+) -> None:
+    print(f"Move mode. Directions: {' '.join(DIRECTION_ORDER)}", flush=True)
+    print("Commands: <direction> <distance_cm> [heading_deg], status, stop, q", flush=True)
+    while True:
+        raw = input("move> ").strip()
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in ("q", "quit", "exit"):
+            if link is not None:
+                link.command_ack("STOP")
+            return
+        if low == "stop":
+            if link is not None:
+                link.command_ack("STOP")
+            continue
+        if low == "status":
+            update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+            telemetry = None
+            if link is not None:
+                telemetry, _stamp = link.latest_telemetry()
+            log_event(args, "status", telemetry=telemetry, ir=ir_bank.read())
+            print_mission_status(brain, pose_tracker, ir_bank.read(), {"result": "status"})
+            continue
+        try:
+            direction, angle_deg, distance_m, heading = parse_manual_waypoint(raw, args.heading)
+        except ValueError as exc:
+            print(f"input error | {exc}", flush=True)
+            continue
+        args.heading = heading
+        watch = ALL_WATCH_SENSORS if args.manual_watch_ir else set()
+        execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            f"manual {direction}",
+            angle_deg,
+            distance_m,
+            watch,
+        )
+
+
+def run_path_mode(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+) -> None:
+    print(f"Path mode. Directions: {' '.join(DIRECTION_ORDER)}", flush=True)
+    print("Enter waypoints one per line. Blank line runs the path. q quits.", flush=True)
+    waypoints: list[tuple[str, float, float, float]] = []
+    while True:
+        raw = input(f"wp {len(waypoints) + 1}> ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            if link is not None:
+                link.command_ack("STOP")
+            return
+        if not raw:
+            break
+        try:
+            waypoints.append(parse_manual_waypoint(raw, args.heading))
+        except ValueError as exc:
+            print(f"input error | {exc}", flush=True)
+
+    watch = ALL_WATCH_SENSORS if args.manual_watch_ir else set()
+    for index, (direction, angle_deg, distance_m, heading) in enumerate(waypoints, start=1):
+        args.heading = heading
+        done = execute_segment(
+            link,
+            pose_tracker,
+            ir_bank,
+            brain,
+            args,
+            f"path {index}/{len(waypoints)} {direction}",
+            angle_deg,
+            distance_m,
+            watch,
+        )
+        if done.get("result") != "completed":
+            print(f"path stopped at waypoint {index}: result={done.get('result')}", flush=True)
+            return
+
+
+def run_ir_monitor(ir_bank: GpioIrBank, args) -> None:
+    print("IR monitor mode. Ctrl-C exits.", flush=True)
+    tracker = IrEdgeTracker()
+    last_print = 0.0
+    while True:
+        state = ir_bank.read()
+        rising, falling = tracker.update(state)
+        now = time.monotonic()
+        if rising or falling or now - last_print >= args.status_period:
+            print(f"ir | {ir_summary(state)} rising={rising} falling={falling}", flush=True)
+            log_event(args, "ir", state=state, rising=rising, falling=falling)
+            last_print = now
+        time.sleep(args.period)
+
+
+def run_ir_train_mode(
+    link: EspPiControlLink | None,
+    pose_tracker: PoseAccumulator,
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    args,
+) -> None:
+    print("IR train mode. Robot waits still, then runs the obstacle state machine on rising edges.", flush=True)
+    print("Front/FL trigger full front avoidance. Left/right trigger forward-until-falling-edge training. Ctrl-C exits.", flush=True)
+    tracker = IrEdgeTracker()
+    mission = MissionMemory()
+    action_budget = [args.max_avoidance_actions]
+    update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+
+    while True:
+        state = ir_bank.read()
+        rising, falling = tracker.update(state)
+        if rising or falling:
+            print(f"train_ir | {ir_summary(state)} rising={rising} falling={falling}", flush=True)
+            log_event(args, "train_ir", state=state, rising=rising, falling=falling)
+
+        front_hits = [name for name in ("front", "front_left", "front_right") if name in rising]
+        side_hits = [name for name in ("left", "right") if name in rising]
+
+        if front_hits:
+            ir_state = {name: False for name in IR_SENSOR_ORDER}
+            for name in front_hits:
+                ir_state[name] = True
+            print(f"train | front sequence from {front_hits}", flush=True)
+            done = execute_front_avoidance(link, pose_tracker, ir_bank, brain, args, ir_state, action_budget, mission)
+            print(f"train | sequence done result={done.get('result')}", flush=True)
+            tracker = IrEdgeTracker()
+            continue
+
+        if side_hits:
+            side_sensor = side_hits[0]
+            print(f"train | side falling-edge sequence for {side_sensor}", flush=True)
+            done = execute_forward_until_side_falling(
+                link,
+                pose_tracker,
+                ir_bank,
+                brain,
+                args,
+                side_sensor,
+                action_budget,
+                mission,
+            )
+            if done.get("result") != "ir_stop":
+                execute_segment(
+                    link,
+                    pose_tracker,
+                    ir_bank,
+                    brain,
+                    args,
+                    "training side clear forward buffer",
+                    0.0,
+                    args.front_advance_distance,
+                    ALL_WATCH_SENSORS,
+                    mission,
+                    move_timeout_s=args.front_advance_timeout,
+                    timeout_returns_done=True,
+                )
+                execute_recenter(link, pose_tracker, ir_bank, brain, args, action_budget, mission)
+            tracker = IrEdgeTracker()
+            continue
+
+        time.sleep(args.period)
+
+
 def ir_summary(ir_state: dict[str, bool]) -> str:
-    return " ".join(f"{IR_LABELS[name]}={1 if ir_state.get(name, False) else 0}" for name in IR_PINS)
+    parts = []
+    for name in IR_SENSOR_ORDER:
+        if name not in IR_PINS:
+            parts.append(f"{IR_LABELS[name]}=NA")
+        else:
+            parts.append(f"{IR_LABELS[name]}={1 if ir_state.get(name, False) else 0}")
+    return " ".join(parts)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Pi master: simple-cardinal brain + GPIO IR + ESP UART PID link.")
+    parser = argparse.ArgumentParser(
+        description="Pi master: simple-cardinal brain + GPIO IR + ESP UART PID link.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Modes:
+  mission     Prompt/run goal-distance mission with obstacle avoidance.
+  move        Interactive single MOVE commands: <direction> <distance_cm> [heading_deg].
+  path        Enter several waypoints, blank line runs them sequentially.
+  ir-monitor  Print IR states plus rising/falling edges. Does not need ESP.
+  ir-train    Stand still, then run avoidance/falling-edge training on IR triggers.
 
+Directions for move/path:
+  {' '.join(DIRECTION_ORDER)}
+
+ESP commands used by this Pi file:
+  PING, INIT_IMU, RESET_ODOM, RESET_ENC, MOVE, STOP.
+  The Pi does not send wheel PWM or TWIST commands in these modes.
+
+Logs:
+  Each run writes events.jsonl and moves.csv under --log-dir unless --no-log is used.
+""",
+    )
+
+    parser.add_argument("--mode", choices=("mission", "path", "move", "ir-monitor", "ir-train"), default="mission")
     parser.add_argument("--port", default=os.environ.get("PI_UART_PORT", "/dev/ttyAMA0"))
     parser.add_argument("--baud", type=int, default=ESP_DEFAULT_BAUD)
     parser.add_argument("--period", type=float, default=ESP_SERIAL_TELEMETRY_INTERVAL_S)
@@ -744,13 +2111,20 @@ def parse_args():
     parser.add_argument("--auto-start", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--mock-ir", action="store_true")
-    parser.add_argument("--active-low", action="store_true")
-    parser.add_argument("--pull-up", action="store_true")
+    parser.add_argument("--ir-logic", choices=("baseline", "active-low", "active-high"), default="baseline")
+    parser.add_argument("--active-low", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pull-up", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--manual-watch-ir", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--prompt-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-dir", default="run_logs")
+    parser.add_argument("--log", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--verbose-serial", action="store_true")
     parser.add_argument("--reset-odom-on-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-encoders-on-start", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--init-imu-on-start", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--goal-distance", type=float, default=1.20)
+    parser.add_argument("--goal-distance", type=float, default=1.20, help="Mission goal distance in meters.")
+    parser.add_argument("--goal-distance-cm", type=float, default=None, help="Mission goal distance in centimeters; overrides --goal-distance.")
     parser.add_argument("--goal-tolerance", type=float, default=0.05)
     parser.add_argument("--line-kp", type=float, default=1.6)
     parser.add_argument("--backoff-distance", type=float, default=0.0)
@@ -764,12 +2138,36 @@ def parse_args():
     parser.add_argument("--sensor-timeout", type=float, default=0.5)
     parser.add_argument("--preferred-first-direction", choices=("left", "right"), default="right")
     parser.add_argument("--max-shift-cycles", type=int, default=12)
+    parser.add_argument("--front-strafe-distance", type=float, default=0.20)
+    parser.add_argument("--front-corner-strafe-distance", type=float, default=0.15)
+    parser.add_argument("--front-advance-distance", type=float, default=0.30)
+    parser.add_argument("--front-strafe-search-distance", type=float, default=1.20)
+    parser.add_argument("--front-corner-buffer-distance", type=float, default=0.05)
+    parser.add_argument("--front-trigger-forward-buffer-distance", type=float, default=0.10)
+    parser.add_argument("--front-trigger-forward-buffer-timeout", type=float, default=0.75)
+    parser.add_argument("--front-trigger-forward-buffer-tolerance", type=float, default=0.005)
+    parser.add_argument("--front-trigger-forward-buffer-attempts", type=int, default=3)
+    parser.add_argument("--front-strafe-search-timeout", type=float, default=8.0)
+    parser.add_argument("--front-corner-buffer-timeout", type=float, default=1.25)
+    parser.add_argument("--front-advance-timeout", type=float, default=4.0)
+    parser.add_argument("--side-follow-search-distance", type=float, default=3.00)
+    parser.add_argument("--side-follow-dry-distance", type=float, default=0.30)
+    parser.add_argument("--side-follow-watch-front", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--side-escape-distance", type=float, default=0.10)
+    parser.add_argument("--side-escape-forward-distance", type=float, default=0.30)
+    parser.add_argument("--max-recenter-attempts", type=int, default=8)
+    parser.add_argument("--max-goal-correction-attempts", type=int, default=4)
+    parser.add_argument("--max-avoidance-actions", type=int, default=24)
 
     args = parser.parse_args()
+    if args.goal_distance_cm is not None:
+        args.goal_distance = args.goal_distance_cm / 100.0
     args.forward_weight = 1.0
     args.lateral_weight = 1.0
     args.backoff_weight = 1.0
     args.max_line_correction_weight = 1.0
+    if args.goal_distance <= 0.0:
+        parser.error("--goal-distance must be greater than zero")
     if args.period <= 0.0:
         parser.error("--period must be greater than zero")
     if args.status_period <= 0.0:
@@ -782,6 +2180,44 @@ def parse_args():
         parser.error("--position-step must be greater than zero")
     if args.min_position_step <= 0.0:
         parser.error("--min-position-step must be greater than zero")
+    if args.front_strafe_distance <= 0.0:
+        parser.error("--front-strafe-distance must be greater than zero")
+    if args.front_corner_strafe_distance <= 0.0:
+        parser.error("--front-corner-strafe-distance must be greater than zero")
+    if args.front_advance_distance <= 0.0:
+        parser.error("--front-advance-distance must be greater than zero")
+    if args.front_strafe_search_distance <= 0.0:
+        parser.error("--front-strafe-search-distance must be greater than zero")
+    if args.front_corner_buffer_distance <= 0.0:
+        parser.error("--front-corner-buffer-distance must be greater than zero")
+    if args.front_trigger_forward_buffer_distance <= 0.0:
+        parser.error("--front-trigger-forward-buffer-distance must be greater than zero")
+    if args.front_trigger_forward_buffer_timeout <= 0.0:
+        parser.error("--front-trigger-forward-buffer-timeout must be greater than zero")
+    if args.front_trigger_forward_buffer_tolerance < 0.0:
+        parser.error("--front-trigger-forward-buffer-tolerance cannot be negative")
+    if args.front_trigger_forward_buffer_attempts <= 0:
+        parser.error("--front-trigger-forward-buffer-attempts must be greater than zero")
+    if args.front_strafe_search_timeout <= 0.0:
+        parser.error("--front-strafe-search-timeout must be greater than zero")
+    if args.front_corner_buffer_timeout <= 0.0:
+        parser.error("--front-corner-buffer-timeout must be greater than zero")
+    if args.front_advance_timeout <= 0.0:
+        parser.error("--front-advance-timeout must be greater than zero")
+    if args.side_follow_search_distance <= 0.0:
+        parser.error("--side-follow-search-distance must be greater than zero")
+    if args.side_follow_dry_distance <= 0.0:
+        parser.error("--side-follow-dry-distance must be greater than zero")
+    if args.side_escape_distance <= 0.0:
+        parser.error("--side-escape-distance must be greater than zero")
+    if args.side_escape_forward_distance <= 0.0:
+        parser.error("--side-escape-forward-distance must be greater than zero")
+    if args.max_recenter_attempts <= 0:
+        parser.error("--max-recenter-attempts must be greater than zero")
+    if args.max_goal_correction_attempts <= 0:
+        parser.error("--max-goal-correction-attempts must be greater than zero")
+    if args.max_avoidance_actions <= 0:
+        parser.error("--max-avoidance-actions must be greater than zero")
     return args
 
 
@@ -805,99 +2241,80 @@ def initialize_link(link: EspPiControlLink, args) -> None:
         link.command_ack("RESET_ODOM")
 
 
+def prompt_goal_if_needed(args) -> None:
+    if args.mode != "mission" or args.auto_start or not args.prompt_goal:
+        return
+    raw = input(f"Goal distance cm [{args.goal_distance * 100.0:.1f}]: ").strip()
+    if not raw:
+        return
+    value_cm = float(raw)
+    if value_cm <= 0.0:
+        raise ValueError("Goal distance must be greater than zero")
+    args.goal_distance = value_cm / 100.0
+
+
 def main() -> None:
     args = parse_args()
-    ir_bank = GpioIrBank(active_low=args.active_low, pull_up=args.pull_up, mock=args.mock_ir or args.dry_run)
+    args.logger = RunLogger(args.mode, args.log_dir) if args.log else NullLogger()
+    if getattr(args.logger, "dir", None) is not None:
+        print(f"log | {args.logger.dir}", flush=True)
+
+    ir_bank = GpioIrBank(
+        active_low=args.active_low,
+        pull_up=args.pull_up,
+        mock=args.mock_ir or args.dry_run,
+        logic=args.ir_logic,
+    )
     brain = SimpleCardinalRealBrain(args)
     link = None
     pose_tracker = PoseAccumulator()
 
     try:
-        if not args.dry_run:
-            link = EspPiControlLink(args.port, args.baud)
+        needs_link = args.mode != "ir-monitor"
+        if not args.dry_run and needs_link:
+            link = EspPiControlLink(args.port, args.baud, verbose_serial=args.verbose_serial)
             initialize_link(link, args)
 
-        if args.auto_start:
-            enabled = True
-        else:
+        if args.mode == "ir-monitor":
+            run_ir_monitor(ir_bank, args)
+            return
+
+        if args.mode == "move":
+            run_move_mode(link, pose_tracker, ir_bank, brain, args)
+            return
+
+        if args.mode == "path":
+            run_path_mode(link, pose_tracker, ir_bank, brain, args)
+            return
+
+        if args.mode == "ir-train":
+            if not args.auto_start:
+                print("Ready for IR training. Press Enter to arm. Ctrl-C stops.", flush=True)
+                input()
+            run_ir_train_mode(link, pose_tracker, ir_bank, brain, args)
+            return
+
+        prompt_goal_if_needed(args)
+        if not args.auto_start:
             print("Ready. Put the robot in a clear area, then press Enter to start. Ctrl-C stops.", flush=True)
             input()
-            enabled = True
 
-        print("Pi brain running. ESP owns position PID; Pi sends only position steps.", flush=True)
-        last_status = 0.0
-        last_error = 0.0
-        last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
-
-        while True:
-            now = time.monotonic()
-
-            try:
-                x, y, yaw = pose_tracker.pose()
-                ir_state = ir_bank.read()
-                brain.update_pose(x, y, yaw, now)
-                brain.update_ir(ir_state, now)
-                brain.set_enabled(enabled)
-                command = brain.step(now)
-
-                if now - last_status >= args.status_period:
-                    print(
-                        "state={state} progress={progress:.3f}/{goal:.3f} cross={cross:.3f} "
-                        "last_move={result} d_cm(f={df:.1f},s={ds:.1f},yaw={dy:.1f}) "
-                        "pose_xy=({x:.3f},{y:.3f}) ir[{ir}]".format(
-                            state=brain.state,
-                            progress=brain.along_track_progress(),
-                            goal=brain.goal_distance,
-                            cross=brain.cross_track_error(),
-                            result=last_done.get("result", "none"),
-                            df=float(last_done.get("forwardCm", 0.0)),
-                            ds=float(last_done.get("strafeCm", 0.0)),
-                            dy=float(last_done.get("headingDeg", math.degrees(yaw))),
-                            x=x,
-                            y=y,
-                            ir=ir_summary(ir_state),
-                        ),
-                        flush=True,
-                    )
-                    last_status = now
-
-                if brain.state == "DONE":
-                    if link is not None:
-                        link.command_ack("STOP")
-                    print("Goal reached; ESP stopped.", flush=True)
-                    break
-
-                step = command_to_position_step(command, brain, args)
-                if step is None:
-                    time.sleep(args.period)
-                    continue
-
-                angle_deg, distance_m = step
-                angle_rad = math.radians(angle_deg)
-                watch_front_ir = math.cos(angle_rad) > 0.2
-                last_done = execute_position_step(
-                    link,
-                    pose_tracker,
-                    ir_bank,
-                    angle_deg,
-                    distance_m,
-                    args,
-                    watch_front_ir,
-                )
-
-            except Exception as exc:
-                if now - last_error >= 1.0:
-                    print(f"error | {exc}", flush=True)
-                    last_error = now
-                if link is not None:
-                    try:
-                        link.send("STOP")
-                    except Exception:
-                        pass
-                time.sleep(0.1)
+        print(
+            f"Pi brain running to {args.goal_distance * 100.0:.1f}cm. "
+            "ESP owns position PID; Pi sends planned full MOVE segments.",
+            flush=True,
+        )
+        run_segment_mission(link, pose_tracker, ir_bank, brain, args)
 
     except KeyboardInterrupt:
         print("\nStopping.", flush=True)
+    except Exception as exc:
+        print(f"error | {exc}", flush=True)
+        if link is not None:
+            try:
+                link.send("STOP")
+            except Exception:
+                pass
     finally:
         if link is not None:
             try:
@@ -906,6 +2323,7 @@ def main() -> None:
                 pass
             link.close()
         ir_bank.close()
+        args.logger.close()
 
 
 if __name__ == "__main__":

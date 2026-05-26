@@ -280,7 +280,7 @@ def move_command(angle_deg: float, distance_cm: float, heading_deg: float, timeo
 
 
 def turn_command(angle_deg: float, timeout_s: float) -> str:
-    return f"TURN angle={angle_deg:.3f} timeout={int(timeout_s * 1000)}"
+    return f"TURN heading={angle_deg:.3f} timeout={int(timeout_s * 1000)}"
 
 
 def execute_position_line(link: EspPiControlLink, line: str, timeout_s: float) -> dict:

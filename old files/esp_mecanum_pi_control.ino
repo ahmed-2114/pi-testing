@@ -28,6 +28,7 @@
   - CAL_IMU seq=N
   - INIT_IMU seq=N        // calibrate IMU bias, then zero yaw
   - RESET_ENC seq=N
+  - RESET_ODOM seq=N
   - MOVE angle=0 dist=120 speed=42 heading=-10.5 seq=N
   - TURN heading=90 speed=12 seq=N
   - STOP seq=N
@@ -190,7 +191,7 @@ bool headingRateSettledLatch = false;
 float positionCurrentCounts = 0.0f;
 float positionErrorCounts = 0.0f;
 float positionCmdRpm = 0.0f;
-float positionTolCm = 1.0f;
+float positionTolCm = 1.2f;
 float posCruiseRpm = 42.0f;
 float posSlowdownStartCm = 10.0f;
 float posFinalWindowCm = 1.0f;
@@ -199,7 +200,7 @@ float posCmdSlewRpmPerSec = 220.0f;
 float posNoReverseBandCm = 0.8f;
 float posIntegralBandCm = 40.0f;
 float posDoneMaxWheelRpm = 0.9f;
-float posDoneTolCm = 0.45f;
+float posDoneTolCm = 0.54f;
 float distOvershootCm = 0.0f;
 float distScaleCompPct = 2.0f;
 float distCompMaxCm = 8.0f;
@@ -212,11 +213,11 @@ float headingErrorDeg = 0.0f;
 float headingCorrRpm = 0.0f;
 float headingCorrMaxRpm = 20.0f;
 int8_t headingCorrSign = -1;
-float headingMoveDeadbandDeg = 0.12f;
+float headingMoveDeadbandDeg = 0.144f;
 float headingMoveKiErrBandDeg = 4.0f;
 float headingEnableBaseRpm = 0.8f;
 float headingHoldMaxRpm = 10.0f;
-float headingHoldDeadbandDeg = 2.0f;
+float headingHoldDeadbandDeg = 2.4f;
 float headingHoldExitRateDps = 2.5f;
 float yawHoldInPlaceKiScale = 0.50f;
 float yawHoldInPlaceKiErrDeg = 8.0f;
@@ -229,7 +230,7 @@ float headingHoldSettleHoldMs = 320.0f;
 float yawHoldWheelKpScale = 0.78f;
 float yawHoldWheelKdScale = 0.06f;
 int16_t yawHoldWheelPwmMax = 200;
-float yawHoldTargetDeadbandRpm = 1.0f;
+float yawHoldTargetDeadbandRpm = 1.2f;
 uint8_t yawHoldBreakawayPwm = 8;
 float yawHoldBreakawayErrDeg = 9.0f;
 float yawHoldWheelPwmSlewPerSec = 550.0f;
@@ -1435,6 +1436,14 @@ void handleCommandLine(String line) {
     resetEncoders();
     STATE_UNLOCK();
     sendJsonLine(buildAckJson(seq, "RESET_ENC", true, "encoders_reset"));
+    return;
+  }
+
+  if (cmd == "RESET_ODOM") {
+    STATE_LOCK();
+    resetEncoders();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "RESET_ODOM", true, "odometry_reset"));
     return;
   }
 

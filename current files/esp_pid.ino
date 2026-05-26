@@ -1,15 +1,38 @@
-// Wheel speed PID tuning sketch for ESP32 mecanum base.
-// Display and tuning are done via Wi-Fi web page (no serial interaction required).
-// Connect to AP: ESP32-PID-TUNE / pid12345, then open http://192.168.4.1
-
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <math.h>
 #include <Wire.h>
+#include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+
+/*
+  ESP32 mecanum controller for Raspberry Pi UART control.
+
+  This sketch preserves the tuned mecanum defaults from the GUI tuning flow:
+  - Wheel PID: Kp=50, Ki=6, Kd=0
+  - RPM signs: +1 / -1 / +1 / -1 in logical order BR / FR / BL / FL
+  - Min PWM: 160
+  - Position + heading tuning:
+      Pos Kp=100, Pos Ki=0, Pos Kd=0
+      Move heading PID: 10 / 0.01 / 0.08
+      Pos max/default=40 rpm, slowdown start=10 cm, final window=1 cm, final min=5 rpm
+      No-reverse band=0.8 cm, done tol=0.54 cm, done max wheel rpm=0.9
+      Dist overshoot=0, dist scale=2%, dist comp max=8 cm
+      Hold heading PID: 0.65 / 0.08 / 1.20
+      Turn overshoot=4.5 deg
+
+  UART protocol:
+  - PING seq=N
+  - STATUS seq=N
+  - ZERO_IMU seq=N
+  - CAL_IMU seq=N
+  - INIT_IMU seq=N        // calibrate IMU bias, then zero yaw
+  - RESET_ENC seq=N
+  - RESET_ODOM seq=N
+  - MOVE angle=0 dist=120 speed=40 heading=-10.5 seq=N
+  - TURN heading=90 speed=12 seq=N
+  - STOP seq=N
+*/
 
 struct EncoderPins {
   uint8_t a;
@@ -44,42 +67,32 @@ struct CascadePidState {
   float out;
 };
 
-enum ControlMode : uint8_t {
-  MODE_SINGLE_WHEEL_VELOCITY = 0,
-  MODE_POSITION_HEADING = 1,
+enum CommandMode : uint8_t {
+  CMD_IDLE = 0,
+  CMD_SEQUENCE = 1,
+  CMD_TWIST = 2,
 };
 
-struct MinPwmSweepState {
-  bool active;
-  int8_t direction;
-  uint8_t startPwm;
-  uint8_t endPwm;
-  uint8_t stepPwm;
-  uint16_t holdMs;
-  uint8_t currentPwm;
-  uint8_t detectedPwm;
-  uint8_t stableMoveTicks;
-  float detectRpmThreshold;
-  float avgAbsRpm;
-  uint32_t stepStartMs;
+enum MovePhase : uint8_t {
+  MOVE_IDLE = 0,
+  MOVE_TURNING = 1,
+  MOVE_DRIVING = 2,
 };
 
+// Encoder index order is BR, FR, FL, BL, matching the working correct_pid.ino GUI controller.
 EncoderPins encoders[4] = {
-    {36, 39, "ENC1 BackLeft"},
+    {36, 39, "ENC1 BackRight"},
     {35, 34, "ENC2 FrontRight"},
     {33, 32, "ENC3 FrontLeft"},
-    {25, 26, "ENC4 BackRight"},
+    {25, 26, "ENC4 BackLeft"},
 };
 
-// Motor mapping validated in your testing:
-// MOTA -> Back Right -> GPIO27, GPIO14 -> ENC4
-// MOTB -> Front Right -> GPIO13, GPIO19 -> ENC2
-// MOTC -> Front Left -> GPIO4, GPIO16  -> ENC3
-// MOTD -> Back Left  -> GPIO17, GPIO18 -> ENC1
+// Logical motor order is BR, FR, BL, FL.
+// encIndex must match the physical encoder paired with each motor.
 MotorPins motors[4] = {
-    {14, 27, "MOTA BackRight", 3, 0, 1},
+    {14, 27, "MOTA BackRight", 0, 0, 1},
     {19, 13, "MOTB FrontRight", 1, 2, 3},
-    {18, 17, "MOTD BackLeft",   0, 6, 7},
+    {18, 17, "MOTD BackLeft",   3, 6, 7},
     {4, 16,  "MOTC FrontLeft",  2, 4, 5},
 };
 
@@ -91,54 +104,55 @@ float measuredRpmRaw[4] = {0, 0, 0, 0};
 float measuredRpm[4] = {0, 0, 0, 0};
 float targetRpm[4] = {0, 0, 0, 0};
 int16_t pwmCmd[4] = {0, 0, 0, 0};
-int8_t rpmSign[4] = {-1, -1, -1, -1};
+// Equivalent to correct_pid.ino encoderSign {-1, +1, -1, +1} after the
+// legacy "-raw" convention inside readMotorSignedCount()/updateMeasuredRpm().
+// Logical order here is BR, FR, BL, FL.
+int8_t rpmSign[4] = {1, -1, 1, -1};
 
 PIDState pid[4] = {
-  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-  {50.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {15.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {15.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {15.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {15.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f},
 };
 
-  MinPwmSweepState minSweep = {
-    false,
-    1,
-    20,
-    90,
-    2,
-    700,
-    0,
-    0,
-    0,
-    2.5f,
-    0.0f,
-    0,
-  };
-
-WebServer server(80);
-
-static SemaphoreHandle_t stateMutex           = nullptr;
-static TaskHandle_t      controlTaskHandle    = nullptr;
-static TaskHandle_t      webTaskHandle        = nullptr;
-static TaskHandle_t      telemetryTaskHandle  = nullptr;
+static SemaphoreHandle_t stateMutex = nullptr;
+static SemaphoreHandle_t serialMutex = nullptr;
+static TaskHandle_t controlTaskHandle = nullptr;
+static TaskHandle_t uartRxTaskHandle = nullptr;
+static TaskHandle_t telemetryTaskHandle = nullptr;
 
 #define STATE_LOCK()   do { if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY); } while (0)
 #define STATE_UNLOCK() do { if (stateMutex) xSemaphoreGive(stateMutex); } while (0)
+#define SERIAL_LOCK()   do { if (serialMutex) xSemaphoreTake(serialMutex, portMAX_DELAY); } while (0)
+#define SERIAL_UNLOCK() do { if (serialMutex) xSemaphoreGive(serialMutex); } while (0)
 
-const char* AP_SSID = "ESP32-PID-TUNE";
-const char* AP_PASS = "pid12345";
-
-const float COUNTS_PER_WHEEL_REV = 4346.8f;  // From your calibration data
-const uint32_t CONTROL_INTERVAL_MS = 20;      // 50 Hz speed loop
+const uint32_t UART_BAUD = 115200;
+const size_t UART_LINE_MAX = 160;
+const uint32_t CONTROL_INTERVAL_MS = 20;
+const uint32_t TELEMETRY_INTERVAL_MS = 100;
 const uint16_t PWM_FREQ = 1000;
 const uint8_t PWM_RES_BITS = 8;
 const int PWM_MAX = 255;
-const float TARGET_RPM_MAX = 60.0f;
+const float TARGET_RPM_MAX = 45.0f;
+const float POSITION_RPM_MAX = 40.0f;  // Max/default translational RPM for position MOVE commands.
+const float MOVE_STRAFE_SIGN = -1.0f;  // Set to -1 to invert MOVE strafe direction, +1 for normal sign.
+// Odom scaling and sign to match correct_pid.ino conventions
+int8_t odomForwardSign = 1;
+int8_t odomStrafeSign = 1;
+float odomForwardScale = 0.9854f;
+float odomStrafeScale = 0.9375f;
+const float COUNTS_PER_WHEEL_REV = 4346.8f;
+const float wheelDiameterCm = 9.7f;
+
+const uint8_t MPU6050_ADDR = 0x68;
+const float MPU6050_GYRO_Z_SCALE = 65.5f;
+const float MPU6050_ACC_SCALE = 16384.0f;
+const uint16_t IMU_BIAS_CAL_SAMPLES = 500;
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 void pwmAttachPinCompat(uint8_t pin, uint8_t channelHint) {
   (void)channelHint;
-  // ESP32 Arduino Core 3.x API: bind PWM directly to pin.
   ledcAttach(pin, PWM_FREQ, PWM_RES_BITS);
 }
 
@@ -148,7 +162,6 @@ void pwmWriteCompat(uint8_t pin, uint8_t channelHint, uint32_t duty) {
 }
 #else
 void pwmAttachPinCompat(uint8_t pin, uint8_t channel) {
-  // ESP32 Arduino Core 2.x API: setup channel then attach pin.
   ledcSetup(channel, PWM_FREQ, PWM_RES_BITS);
   ledcAttachPin(pin, channel);
 }
@@ -159,27 +172,38 @@ void pwmWriteCompat(uint8_t pin, uint8_t channel, uint32_t duty) {
 }
 #endif
 
-float pidTargetRpm = 50.0f;
-uint8_t activeWheel = 0;
+bool imuOk = false;
+float imuYawDeg = 0.0f;
+float imuGyroDps = 0.0f;
+float imuGyroDpsFilt = 0.0f;
+float headingGyroLpfAlpha = 0.18f;
+float imuBiasDps = 0.0f;
+float imuAccXg = 0.0f;
+float imuAccYg = 0.0f;
+float imuAccXYg = 0.0f;
+float imuAccAlpha = 0.20f;
+float rpmFilterAlpha = 0.20f;
+
+CascadePidState posPid = {100.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // Position PID: Kp, Ki, Kd, integral, previous error, output.
+CascadePidState headingPid = {10.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};  // Moving heading PID: Kp, Ki, Kd, integral, previous error, output.
+CascadePidState headingHoldPid = {0.65f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+CommandMode commandMode = CMD_IDLE;
+MovePhase movePhase = MOVE_IDLE;
 bool controllerEnabled = false;
-uint8_t minPwm = 160;
-bool rawModeEnabled = false;
-int16_t rawPwmCmd = 0;
-ControlMode controlMode = MODE_SINGLE_WHEEL_VELOCITY;
-
-CascadePidState posPid = {0.05f, 0.0018f, 0.0f, 0.0f, 0.0f, 0.0f};
-CascadePidState headingPid = {1.95f, 0.01f, 0.08f, 0.0f, 0.0f, 0.0f};
-
-float positionTargetCounts = 0.0f;
-float positionCurrentCounts = 0.0f;
-float positionErrorCounts = 0.0f;
-float positionTolCm = 1.0f;
-float positionCmdRpm = 0.0f;
-float positionStepCm = 30.0f;
-float wheelDiameterCm = 9.7f;
+bool holdHeadingAtStop = true;
+bool yawHoldInPlaceMode = false;
 bool positionDone = false;
 uint8_t positionDoneTicks = 0;
-float posCruiseRpm = 42.0f;
+bool headingHoldActive = false;
+bool headingErrSettledLatch = false;
+bool headingRateSettledLatch = false;
+
+float positionCurrentCounts = 0.0f;
+float positionErrorCounts = 0.0f;
+float positionCmdRpm = 0.0f;
+float positionTolCm = 1.0f;
+float posCruiseRpm = POSITION_RPM_MAX;  // Default MOVE cruise RPM when the Pi does not send speed=.
 float posSlowdownStartCm = 10.0f;
 float posFinalWindowCm = 1.0f;
 float posFinalMinRpm = 5.0f;
@@ -187,7 +211,7 @@ float posCmdSlewRpmPerSec = 220.0f;
 float posNoReverseBandCm = 0.8f;
 float posIntegralBandCm = 40.0f;
 float posDoneMaxWheelRpm = 0.9f;
-float posDoneTolCm = 0.45f;
+float posDoneTolCm = 1.0f;
 float distOvershootCm = 0.0f;
 float distScaleCompPct = 2.0f;
 float distCompMaxCm = 8.0f;
@@ -200,128 +224,75 @@ float headingErrorDeg = 0.0f;
 float headingCorrRpm = 0.0f;
 float headingCorrMaxRpm = 20.0f;
 int8_t headingCorrSign = -1;
-float headingDeadbandDeg = 1.5f;
-float headingMoveDeadbandDeg = 0.12f;
+float headingMoveDeadbandDeg = 0.144f;
 float headingMoveKiErrBandDeg = 4.0f;
 float headingEnableBaseRpm = 0.8f;
-bool autoLockHeadingOnStep = true;
-bool holdHeadingAtStop = true;
-bool yawHoldInPlaceMode = false;
 float headingHoldMaxRpm = 10.0f;
-float headingHoldDeadbandDeg = 2.0f;
-CascadePidState headingHoldPid = {0.65f, 0.08f, 1.20f, 0.0f, 0.0f, 0.0f};
-float headingHoldMinRpm = 1.2f;  // legacy, no longer used in control loop
-uint8_t holdMinPwm = 0;          // kept for UI compatibility; intentionally not used in hold control
-float headingHoldEnterDeg = 5.0f;
-float headingHoldExitDeg = 1.0f;
+float headingHoldDeadbandDeg = 2.4f;
 float headingHoldExitRateDps = 2.5f;
-float headingHoldKickErrDeg = 10.0f;
-float headingHoldKickGyroDps = 1.0f;
 float yawHoldInPlaceKiScale = 0.50f;
 float yawHoldInPlaceKiErrDeg = 8.0f;
 float headingCorrSlewRpmPerSec = 70.0f;
-bool headingHoldActive = false;
 float headingHoldStableMs = 0.0f;
 float headingCorrCmdPrev = 0.0f;
-bool headingErrSettledLatch = false;
-bool headingRateSettledLatch = false;
 float turnOvershootDeg = 4.5f;
-float poseMoveRequestedYawDeg = 0.0f;
-float poseMoveAppliedBiasDeg = 0.0f;
+float headingHoldSettleHoldMs = 320.0f;
 
-// Sequenced move command state: first rotate to heading, then drive distance while holding heading.
-bool poseMoveActive = false;
-uint8_t poseMovePhase = 0;  // 0=idle, 1=turning, 2=driving
-float poseMoveDistanceCm = 0.0f;
-float poseMoveStartCounts = 0.0f;
-float poseMoveTargetCounts = 0.0f;
-uint32_t poseMovePhaseStartMs = 0;
-uint32_t poseMoveTurnTimeoutMs = 12000;
-uint8_t poseMoveLastResult = 0;  // 0=none, 1=completed, 2=turn-timeout, 3=imu-missing
-float poseMoveTurnNearMs = 0.0f;
-float poseMoveTurnCloseMs = 0.0f;
-bool poseMoveTurnOnly = false;
-float poseMoveAppliedDistBiasCm = 0.0f;
-
-// Wheel-loop gain scheduling for gentle yaw hold behavior.
 float yawHoldWheelKpScale = 0.78f;
 float yawHoldWheelKdScale = 0.06f;
 int16_t yawHoldWheelPwmMax = 200;
-float yawHoldTargetDeadbandRpm = 1.0f;
+float yawHoldTargetDeadbandRpm = 1.2f;
 uint8_t yawHoldBreakawayPwm = 8;
 float yawHoldBreakawayErrDeg = 9.0f;
 float yawHoldWheelPwmSlewPerSec = 550.0f;
 int16_t yawHoldWheelCmdPrev[4] = {0, 0, 0, 0};
 
-// In-place yaw speed profile: cruise fast, then transition to a low-speed final capture zone near target.
 float yawHoldCruiseRpm = 50.0f;
-float yawHoldMinApproachRpm = 30.0f;
-float yawHoldSlowdownStartDeg = 30.0f;
-float yawHoldFinalCaptureDeg = 8.0f;
 float yawHoldFinalCaptureRpm = 6.5f;
 float yawHoldFinalMinRpm = 3.2f;
-float headingHoldSettleHoldMs = 320.0f;
+float yawHoldSlowdownStartDeg = 30.0f;
+float yawHoldFinalCaptureDeg = 8.0f;
 
-bool imuOk = false;
-float imuYawDeg = 0.0f;
-float imuGyroDps = 0.0f;
-float imuGyroDpsFilt = 0.0f;
-float headingGyroLpfAlpha = 0.18f;
-float imuBiasDps = 0.0f;
-float imuAccXg = 0.0f;
-float imuAccYg = 0.0f;
-float imuAccXYg = 0.0f;
-float imuAccAlpha = 0.20f;
-float rpmFilterAlpha = 0.02f;
+uint8_t minPwm = 160;
 
-bool slipEnabled = true;
-bool slipDetected = false;
-float slipCandidateMs = 0.0f;
-float slipWheelRpmThresh = 12.0f;
-float slipAccelThreshG = 0.03f;
-float slipDetectMs = 300.0f;
-float slipReleaseMs = 200.0f;
-float slipMaxRpm = 25.0f;
-float slipAvgWheelRpm = 0.0f;
+uint32_t activeSeq = 0;
+float activeMoveAngleDeg = 0.0f;
+float activeMoveDistanceCm = 0.0f;
+float activeMoveRequestedYawDeg = 0.0f;
+float activeMoveAppliedYawDeg = 0.0f;
+float activeMoveAppliedDistBiasCm = 0.0f;
+float activeMoveCruiseRpm = POSITION_RPM_MAX;  // Active MOVE cruise RPM after applying the position max clamp.
+float activeTurnMaxRpm = 10.0f;
+float activeMoveMix[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+float activeMoveDirForward = 1.0f;
+float activeMoveDirStrafe = 0.0f;
+float activeMoveStartForwardCounts = 0.0f;
+float activeMoveStartStrafeCounts = 0.0f;
+float activeMoveTargetCounts = 0.0f;
+bool activeMoveTurnOnly = false;
+uint32_t activeMoveTurnTimeoutMs = 12000;
+uint32_t activeMovePhaseStartMs = 0;
+float activeMoveTurnNearMs = 0.0f;
+float activeMoveTurnCloseMs = 0.0f;
 
-// Encoder dropout guard: if one wheel's encoder is effectively dead while others move,
-// exclude it from distance averaging and drive that wheel with bounded open-loop fallback.
-bool encoderHealthy[4] = {true, true, true, true};
-float encoderDeadCandidateMs[4] = {0, 0, 0, 0};
-float encoderRecoverCandidateMs[4] = {0, 0, 0, 0};
-float encoderDeadDetectTargetRpm = 8.0f;
-float encoderDeadDetectMeasuredRpm = 0.8f;
-uint8_t encoderDeadDetectPwm = 210;
-float encoderDeadDetectMs = 500.0f;
-float encoderRecoverRpm = 3.0f;
-float encoderRecoverMs = 280.0f;
-float encoderFallbackPwmPerRpm = 4.0f;
-int16_t encoderFallbackPwmMax = 220;
+float bodyForwardCounts = 0.0f;
+float bodyStrafeCounts = 0.0f;
 
-// Runtime debug telemetry for yaw-hold diagnostics.
-bool debugSerialEnabled = false;
-uint16_t debugSerialPeriodMs = 120;
-uint32_t lastDebugSerialMs = 0;
-uint8_t debugYawPhase = 0;  // 0=idle/off, 1=moving correction, 2=hold active, 3=hold settled
+float twistForwardRpm = 0.0f;
+float twistStrafeRpm = 0.0f;
+float twistTurnRpm = 0.0f;
+uint32_t twistTimeoutMs = 0;
+uint32_t twistStartMs = 0;
+
+uint8_t debugYawPhase = 0;
 bool debugErrSettled = false;
 bool debugRateSettled = false;
 float debugRawHeadingErrDeg = 0.0f;
 float debugUsedHeadingErrDeg = 0.0f;
-float debugCorrTargetRpm = 0.0f;
-float debugCorrAfterSlewRpm = 0.0f;
-float debugWheelErr[4] = {0, 0, 0, 0};
-float debugWheelPidOut[4] = {0, 0, 0, 0};
-int16_t debugWheelCmdPreBreakaway[4] = {0, 0, 0, 0};
 
-const uint8_t MPU6050_ADDR = 0x68;
-const float MPU6050_GYRO_Z_SCALE = 65.5f;  // LSB/(deg/s) at +-500 dps
-const float MPU6050_ACC_SCALE = 16384.0f;  // LSB/g at +-2g
-
-const uint8_t MIN_SWEEP_MIN_PWM = 0;
-const uint8_t MIN_SWEEP_MAX_PWM = 255;
-
-uint32_t lastControlMs = 0;
-uint32_t lastPrintMs = 0;
+bool pendingDoneEvent = false;
+uint32_t pendingDoneSeq = 0;
+uint8_t pendingDoneCode = 0;
 
 bool isInputOnlyPin(uint8_t pin) {
   return pin == 34 || pin == 35 || pin == 36 || pin == 39;
@@ -353,9 +324,7 @@ float applyTurnOvershootComp(float requestedYawDeg, float currentYawDeg, float m
 }
 
 uint32_t computePoseTurnTimeoutMs(float targetYawDeg, float currentYawDeg, float maxTurnRpm) {
-  // Estimate timeout from angular distance and available turn authority,
-  // then add margin so normal settling is not treated as failure.
-  float absErrDeg = fabs(shortestAngleErrorDeg(targetYawDeg, currentYawDeg));
+  float absErrDeg = fabsf(shortestAngleErrorDeg(targetYawDeg, currentYawDeg));
   float rpmForEstimate = max(4.0f, maxTurnRpm);
   float estRateDps = max(6.0f, 0.95f * rpmForEstimate);
   float estTurnMs = (absErrDeg / estRateDps) * 1000.0f;
@@ -365,14 +334,12 @@ uint32_t computePoseTurnTimeoutMs(float targetYawDeg, float currentYawDeg, float
 }
 
 float countsToCm(float counts) {
-  float d = constrain(wheelDiameterCm, 1.0f, 30.0f);
-  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * d);
+  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * wheelDiameterCm);
   return counts / countsPerCm;
 }
 
 float cmToCounts(float cm) {
-  float d = constrain(wheelDiameterCm, 1.0f, 30.0f);
-  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * d);
+  float countsPerCm = COUNTS_PER_WHEEL_REV / (PI * wheelDiameterCm);
   return cm * countsPerCm;
 }
 
@@ -386,12 +353,9 @@ float computeDistanceCompCm(float requestedAbsCm) {
   if (req >= 20.0f && distScaleCompPct > 0.001f) {
     comp += req * (distScaleCompPct * 0.01f);
   }
-
-  // Apply an extra trim only for large moves to correct persistent long-run under-travel.
   if (req >= max(20.0f, distLongMoveStartCm)) {
     comp += max(0.0f, distLongMoveExtraCm);
   }
-
   return constrain(comp, 0.0f, max(0.0f, distCompMaxCm));
 }
 
@@ -399,6 +363,19 @@ void resetCascadePid(CascadePidState& s) {
   s.integral = 0.0f;
   s.prevError = 0.0f;
   s.out = 0.0f;
+}
+
+void resetPidState(uint8_t i) {
+  pid[i].integral = 0.0f;
+  pid[i].prevError = 0.0f;
+  pid[i].out = 0.0f;
+}
+
+void resetAllPidStates() {
+  for (uint8_t i = 0; i < 4; i++) {
+    resetPidState(i);
+    yawHoldWheelCmdPrev[i] = 0;
+  }
 }
 
 void resetHighLevelControllers() {
@@ -415,39 +392,14 @@ void resetHighLevelControllers() {
   headingRateSettledLatch = false;
   headingHoldStableMs = 0.0f;
   headingCorrCmdPrev = 0.0f;
-  yawHoldInPlaceMode = false;
-  slipCandidateMs = 0.0f;
-  slipDetected = false;
   debugYawPhase = 0;
   debugErrSettled = false;
   debugRateSettled = false;
   debugRawHeadingErrDeg = 0.0f;
   debugUsedHeadingErrDeg = 0.0f;
-  debugCorrTargetRpm = 0.0f;
-  debugCorrAfterSlewRpm = 0.0f;
-  poseMoveTurnNearMs = 0.0f;
-  poseMoveTurnCloseMs = 0.0f;
-  for (uint8_t i = 0; i < 4; i++) {
-    yawHoldWheelCmdPrev[i] = 0;
-  }
-}
-
-void cancelPoseMove(uint8_t resultCode = 0) {
-  if (resultCode != 0) {
-    poseMoveLastResult = resultCode;
-  }
-  poseMoveActive = false;
-  poseMovePhase = 0;
-  poseMoveDistanceCm = 0.0f;
-  poseMoveStartCounts = 0.0f;
-  poseMoveTargetCounts = 0.0f;
-  poseMovePhaseStartMs = 0;
-  poseMoveTurnNearMs = 0.0f;
-  poseMoveTurnCloseMs = 0.0f;
-  poseMoveTurnOnly = false;
-  poseMoveAppliedDistBiasCm = 0.0f;
-  poseMoveRequestedYawDeg = headingTargetDeg;
-  poseMoveAppliedBiasDeg = 0.0f;
+  activeMoveTurnNearMs = 0.0f;
+  activeMoveTurnCloseMs = 0.0f;
+  resetAllPidStates();
 }
 
 bool imuWriteReg(uint8_t reg, uint8_t value) {
@@ -517,7 +469,6 @@ bool imuCalibrateBias(uint16_t samples) {
   if (okCount < samples / 2) {
     return false;
   }
-
   imuBiasDps = sum / (float)okCount;
   return true;
 }
@@ -527,9 +478,9 @@ bool imuInit() {
   delay(10);
 
   bool ok = true;
-  ok &= imuWriteReg(0x6B, 0x00);  // Wake up MPU6050
-  ok &= imuWriteReg(0x1B, 0x08);  // Gyro FS_SEL=1 => +-500 dps
-  ok &= imuWriteReg(0x1A, 0x03);  // DLPF for less noise
+  ok &= imuWriteReg(0x6B, 0x00);
+  ok &= imuWriteReg(0x1B, 0x08);
+  ok &= imuWriteReg(0x1A, 0x03);
   delay(50);
 
   imuOk = ok;
@@ -574,567 +525,6 @@ void imuUpdate(float dt) {
   float a = constrain(headingGyroLpfAlpha, 0.02f, 1.0f);
   imuGyroDpsFilt += a * (imuGyroDps - imuGyroDpsFilt);
   imuYawDeg = wrapAngleDeg(imuYawDeg + imuGyroDps * dt);
-}
-
-void updateSlipDetector(float dt) {
-  bool yawHoldOnly = (controlMode == MODE_POSITION_HEADING) && (fabsf(positionCmdRpm) < headingEnableBaseRpm);
-
-  if (dt <= 0.0001f || !controllerEnabled || rawModeEnabled || minSweep.active || !slipEnabled || !imuOk) {
-    slipCandidateMs = 0.0f;
-    slipDetected = false;
-    slipAvgWheelRpm = 0.0f;
-    return;
-  }
-
-  if (yawHoldOnly) {
-    slipCandidateMs = 0.0f;
-    slipDetected = false;
-    slipAvgWheelRpm = 0.0f;
-    return;
-  }
-
-  float avgAbsTarget = 0.0f;
-  float avgAbsMeasured = 0.0f;
-  for (uint8_t i = 0; i < 4; i++) {
-    avgAbsTarget += fabsf(targetRpm[i]);
-    avgAbsMeasured += fabsf(measuredRpm[i]);
-  }
-  avgAbsTarget /= 4.0f;
-  avgAbsMeasured /= 4.0f;
-  slipAvgWheelRpm = avgAbsMeasured;
-
-  bool wheelsSpinning = avgAbsMeasured >= slipWheelRpmThresh;
-  bool commandMoving = avgAbsTarget >= slipWheelRpmThresh;
-  bool bodyNotMoving = imuAccXYg <= slipAccelThreshG;
-  bool candidate = wheelsSpinning && commandMoving && bodyNotMoving;
-
-  float dtMs = dt * 1000.0f;
-  float detectMs = constrain(slipDetectMs, 80.0f, 3000.0f);
-  float releaseMs = constrain(slipReleaseMs, 40.0f, 3000.0f);
-
-  if (candidate) {
-    slipCandidateMs += dtMs;
-    if (slipCandidateMs > detectMs * 2.0f) {
-      slipCandidateMs = detectMs * 2.0f;
-    }
-  } else {
-    slipCandidateMs -= dtMs * (detectMs / releaseMs);
-    if (slipCandidateMs < 0.0f) {
-      slipCandidateMs = 0.0f;
-    }
-  }
-
-  slipDetected = (slipCandidateMs >= detectMs);
-}
-
-float getAverageMotorEncoderCount() {
-  int64_t sum = 0;
-  uint8_t used = 0;
-  for (uint8_t i = 0; i < 4; i++) {
-    if (!encoderHealthy[i]) {
-      continue;
-    }
-    // Keep position sign convention aligned with measured RPM convention.
-    int32_t raw = readEncoderCount(motors[i].encIndex);
-    int32_t signedCount = rpmSign[i] * (-raw);
-    sum += (int64_t)signedCount;
-    used++;
-  }
-  if (used == 0) {
-    for (uint8_t i = 0; i < 4; i++) {
-      int32_t raw = readEncoderCount(motors[i].encIndex);
-      int32_t signedCount = rpmSign[i] * (-raw);
-      sum += (int64_t)signedCount;
-    }
-    return (float)sum / 4.0f;
-  }
-  return (float)sum / (float)used;
-}
-
-void updateEncoderHealth(float dt) {
-  if (dt <= 0.0001f) {
-    return;
-  }
-
-  float dtMs = dt * 1000.0f;
-  float detectMs = constrain(encoderDeadDetectMs, 120.0f, 3000.0f);
-  float recoverMs = constrain(encoderRecoverMs, 80.0f, 2000.0f);
-
-  bool translational = controllerEnabled &&
-                       (controlMode == MODE_POSITION_HEADING) &&
-                       !yawHoldInPlaceMode &&
-                       (fabsf(positionCmdRpm) >= 4.0f);
-
-  for (uint8_t i = 0; i < 4; i++) {
-    float peerAbs = 0.0f;
-    uint8_t peerCount = 0;
-    for (uint8_t j = 0; j < 4; j++) {
-      if (j == i) continue;
-      peerAbs += fabsf(measuredRpm[j]);
-      peerCount++;
-    }
-    if (peerCount > 0) {
-      peerAbs /= (float)peerCount;
-    }
-
-    bool deadCandidate = translational &&
-                         (fabsf(targetRpm[i]) >= encoderDeadDetectTargetRpm) &&
-                         (fabsf(measuredRpm[i]) <= encoderDeadDetectMeasuredRpm) &&
-                         (peerAbs >= encoderDeadDetectTargetRpm * 0.6f) &&
-                         (abs(pwmCmd[i]) >= (int)encoderDeadDetectPwm);
-
-    if (deadCandidate) {
-      encoderDeadCandidateMs[i] += dtMs;
-      if (encoderDeadCandidateMs[i] > detectMs * 2.0f) {
-        encoderDeadCandidateMs[i] = detectMs * 2.0f;
-      }
-    } else {
-      encoderDeadCandidateMs[i] -= dtMs;
-      if (encoderDeadCandidateMs[i] < 0.0f) {
-        encoderDeadCandidateMs[i] = 0.0f;
-      }
-    }
-
-    if (encoderDeadCandidateMs[i] >= detectMs) {
-      encoderHealthy[i] = false;
-    }
-
-    if (fabsf(measuredRpm[i]) >= encoderRecoverRpm) {
-      encoderRecoverCandidateMs[i] += dtMs;
-      if (encoderRecoverCandidateMs[i] > recoverMs * 2.0f) {
-        encoderRecoverCandidateMs[i] = recoverMs * 2.0f;
-      }
-    } else {
-      encoderRecoverCandidateMs[i] -= dtMs;
-      if (encoderRecoverCandidateMs[i] < 0.0f) {
-        encoderRecoverCandidateMs[i] = 0.0f;
-      }
-    }
-
-    if (encoderRecoverCandidateMs[i] >= recoverMs) {
-      encoderHealthy[i] = true;
-      encoderDeadCandidateMs[i] = 0.0f;
-    }
-  }
-}
-
-void updateHighLevelTargets(float dt) {
-  for (uint8_t i = 0; i < 4; i++) {
-    targetRpm[i] = 0.0f;
-  }
-
-  debugYawPhase = 0;
-  debugErrSettled = false;
-  debugRateSettled = false;
-  debugRawHeadingErrDeg = 0.0f;
-  debugUsedHeadingErrDeg = 0.0f;
-  debugCorrTargetRpm = 0.0f;
-  debugCorrAfterSlewRpm = 0.0f;
-
-  if (!controllerEnabled) {
-    return;
-  }
-
-  if (controlMode == MODE_SINGLE_WHEEL_VELOCITY) {
-    targetRpm[activeWheel] = constrain(pidTargetRpm, 0.0f, TARGET_RPM_MAX);
-    return;
-  }
-
-  if (poseMoveActive && poseMovePhase == 1) {
-    // During turn phase, force in-place yaw hold behavior.
-    yawHoldInPlaceMode = true;
-    holdHeadingAtStop = true;
-  }
-
-  positionCurrentCounts = getAverageMotorEncoderCount();
-  if (yawHoldInPlaceMode) {
-    // Dedicated in-place yaw mode: freeze translation loop so hold phase is never interrupted.
-    positionErrorCounts = 0.0f;
-    positionDone = true;
-    positionDoneTicks = 5;
-    positionCmdRpm = 0.0f;
-    posCmdPrevRpm = 0.0f;
-    posPid.out = 0.0f;
-    resetCascadePid(posPid);
-  } else {
-    positionErrorCounts = positionTargetCounts - positionCurrentCounts;
-    float positionErrorCm = countsToCm(positionErrorCounts);
-    float absPositionErrCm = fabsf(positionErrorCm);
-    float avgAbsWheelRpm = 0.0f;
-    for (uint8_t i = 0; i < 4; i++) {
-      avgAbsWheelRpm += fabsf(measuredRpm[i]);
-    }
-    avgAbsWheelRpm *= 0.25f;
-
-    float doneTolCm = constrain(posDoneTolCm, 0.2f, max(2.0f, positionTolCm));
-    bool nearPosTol = absPositionErrCm <= min(positionTolCm, doneTolCm);
-    bool wheelSettled = avgAbsWheelRpm <= max(0.4f, posDoneMaxWheelRpm);
-    if (nearPosTol && wheelSettled) {
-      if (positionDoneTicks < 255) positionDoneTicks++;
-    } else {
-      positionDoneTicks = 0;
-    }
-    positionDone = (positionDoneTicks >= 8);
-
-    float iBandCm = max(positionTolCm + 0.2f, posIntegralBandCm);
-    if (!positionDone && absPositionErrCm <= iBandCm) {
-      posPid.integral += positionErrorCounts * dt;
-      posPid.integral = constrain(posPid.integral, -30000.0f, 30000.0f);
-    } else {
-      // Bleed integral away when far from target so it cannot cause end-of-move overshoot.
-      posPid.integral *= 0.85f;
-      if (absPositionErrCm > (iBandCm + 5.0f)) {
-        posPid.integral = 0.0f;
-      }
-    }
-
-    float posDeriv = (positionErrorCounts - posPid.prevError) / dt;
-    posPid.prevError = positionErrorCounts;
-
-    float base = posPid.kp * positionErrorCounts + posPid.ki * posPid.integral + posPid.kd * posDeriv;
-
-    // Position approach profile: strong cruise far away, then intentionally taper command near goal.
-    float cruiseRpm = constrain(posCruiseRpm, 0.0f, TARGET_RPM_MAX);
-    float finalMinRpm = constrain(posFinalMinRpm, 0.0f, cruiseRpm);
-    float finalWinCm = max(positionTolCm + 0.1f, posFinalWindowCm);
-    float slowStartCm = max(finalWinCm + 0.2f, posSlowdownStartCm);
-    float profileMaxRpm = cruiseRpm;
-    if (absPositionErrCm <= slowStartCm) {
-      float t = (absPositionErrCm - finalWinCm) / max(0.2f, (slowStartCm - finalWinCm));
-      t = constrain(t, 0.0f, 1.0f);
-      profileMaxRpm = finalMinRpm + t * (cruiseRpm - finalMinRpm);
-    }
-    profileMaxRpm = constrain(profileMaxRpm, finalMinRpm, cruiseRpm);
-    base = constrain(base, -profileMaxRpm, profileMaxRpm);
-
-    // Prevent stalling while still outside tolerance.
-    if (!positionDone && absPositionErrCm > (positionTolCm + 0.3f) && fabsf(base) < finalMinRpm) {
-      base = (positionErrorCm >= 0.0f ? 1.0f : -1.0f) * finalMinRpm;
-    }
-
-    // Near the goal, never reverse direction to "hunt" around the target.
-    float noReverseBand = max(0.25f, min(posNoReverseBandCm, max(0.6f, positionTolCm * 0.9f)));
-    if (absPositionErrCm <= noReverseBand && (base * positionErrorCm) < 0.0f) {
-      base = 0.0f;
-      posPid.integral = 0.0f;
-    }
-
-    if (positionDone) {
-      base = 0.0f;
-    }
-
-    float posSlew = max(0.0f, posCmdSlewRpmPerSec) * dt;
-    float cmd = posCmdPrevRpm + constrain(base - posCmdPrevRpm, -posSlew, posSlew);
-    if (positionDone) {
-      cmd = 0.0f;
-    }
-
-    posCmdPrevRpm = cmd;
-    posPid.out = cmd;
-    positionCmdRpm = cmd;
-  }
-
-  float corr = 0.0f;
-  headingErrorDeg = 0.0f;
-  if (imuOk) {
-    if (positionDone && holdHeadingAtStop && !yawHoldInPlaceMode && !poseMoveActive && positionDoneTicks >= 20) {
-      // After a stable stop, track IMU drift so hold loop does not re-wake and jitter in place.
-      headingTargetDeg = imuYawDeg;
-    }
-
-    float rawHeadingError = shortestAngleErrorDeg(headingTargetDeg, imuYawDeg);
-    debugRawHeadingErrDeg = rawHeadingError;
-    bool movingPhase = !positionDone;
-    bool holdPhase = positionDone && holdHeadingAtStop;
-    float corrTarget = 0.0f;
-
-    if (movingPhase) {
-      debugYawPhase = 1;
-      float errMove = rawHeadingError;
-      float moveDb = constrain(headingMoveDeadbandDeg, 0.0f, 10.0f);
-      if (fabsf(errMove) <= moveDb) {
-        errMove = 0.0f;
-      } else if (errMove > 0.0f) {
-        errMove -= moveDb;
-      } else {
-        errMove += moveDb;
-      }
-      debugUsedHeadingErrDeg = errMove;
-
-      // Damped move correction: P on heading error, D on filtered yaw-rate.
-      float uMove = headingPid.kp * errMove - headingPid.kd * imuGyroDpsFilt;
-      float moveKiBand = max(moveDb + 0.2f, headingMoveKiErrBandDeg);
-      if (fabsf(headingPid.ki) > 0.0001f && fabsf(errMove) < moveKiBand) {
-        headingPid.integral += errMove * dt;
-        headingPid.integral = constrain(headingPid.integral, -40.0f, 40.0f);
-        uMove += headingPid.ki * headingPid.integral;
-      } else {
-        headingPid.integral = 0.0f;
-      }
-
-      uMove *= (float)headingCorrSign;
-      corrTarget = constrain(uMove, -headingCorrMaxRpm, headingCorrMaxRpm);
-      debugCorrTargetRpm = corrTarget;
-
-      headingPid.prevError = errMove;
-      headingPid.out = corrTarget;
-      headingErrorDeg = errMove;
-
-      resetCascadePid(headingHoldPid);
-      headingHoldActive = false;
-      headingHoldStableMs = 0.0f;
-    } else if (holdPhase) {
-      float errAbs = fabsf(rawHeadingError);
-      float rateAbs = fabsf(imuGyroDpsFilt);
-      float errEnter = max(headingHoldDeadbandDeg, 0.05f);
-      float rateEnter = max(headingHoldExitRateDps, 0.05f);
-      float errExit = errEnter + 0.6f;
-      float rateExit = rateEnter + 0.8f;
-
-      if (!yawHoldInPlaceMode) {
-        // After translation completes, keep heading locked tightly with gentle authority.
-        errEnter = min(errEnter, 0.55f);
-        errExit = errEnter + 0.25f;
-        rateEnter = min(rateEnter, 1.8f);
-        rateExit = rateEnter + 0.5f;
-      }
-
-      if (headingErrSettledLatch) {
-        headingErrSettledLatch = errAbs <= errExit;
-      } else {
-        headingErrSettledLatch = errAbs <= errEnter;
-      }
-
-      if (headingRateSettledLatch) {
-        headingRateSettledLatch = rateAbs <= rateExit;
-      } else {
-        headingRateSettledLatch = rateAbs <= rateEnter;
-      }
-
-      bool errSettled = headingErrSettledLatch;
-      bool rateSettled = headingRateSettledLatch;
-      debugErrSettled = errSettled;
-      debugRateSettled = rateSettled;
-
-      if (errSettled && rateSettled) {
-        debugYawPhase = 3;
-        headingHoldStableMs += dt * 1000.0f;
-        if (headingHoldStableMs >= headingHoldSettleHoldMs) {
-          // Require a short dwell before declaring settled so the loop cannot chatter between states.
-          corrTarget = 0.0f;
-          debugUsedHeadingErrDeg = 0.0f;
-          debugCorrTargetRpm = 0.0f;
-          headingHoldActive = false;
-          resetCascadePid(headingHoldPid);
-        }
-      } else {
-        debugYawPhase = 2;
-        headingHoldStableMs = 0.0f;
-        headingHoldActive = true;
-
-        float errHold = rawHeadingError;
-        if (fabsf(errHold) <= headingHoldDeadbandDeg) {
-          errHold = 0.0f;
-        } else if (errHold > 0.0f) {
-          errHold -= headingHoldDeadbandDeg;
-        } else {
-          errHold += headingHoldDeadbandDeg;
-        }
-        debugUsedHeadingErrDeg = errHold;
-
-        // Stable hold correction: P on deadbanded error, D on filtered yaw-rate.
-        float uHold = headingHoldPid.kp * errHold - headingHoldPid.kd * imuGyroDpsFilt;
-
-        // In-place mode uses a reduced Ki so bias can be corrected without reintroducing hard oscillation.
-        float holdKiEff = headingHoldPid.ki;
-        float holdKiErrBand = 6.0f;
-        if (yawHoldInPlaceMode) {
-          holdKiEff *= yawHoldInPlaceKiScale;
-          holdKiErrBand = max(4.0f, yawHoldInPlaceKiErrDeg);
-        }
-        if (fabsf(holdKiEff) > 0.0001f && fabsf(errHold) < holdKiErrBand) {
-          headingHoldPid.integral += errHold * dt;
-          float iLim = yawHoldInPlaceMode ? 24.0f : 20.0f;
-          headingHoldPid.integral = constrain(headingHoldPid.integral, -iLim, iLim);
-          uHold += holdKiEff * headingHoldPid.integral;
-        } else {
-          headingHoldPid.integral = 0.0f;
-        }
-
-        uHold *= (float)headingCorrSign;
-
-        float holdMaxEff = headingHoldMaxRpm;
-        if (!yawHoldInPlaceMode) {
-          holdMaxEff = min(holdMaxEff, 3.2f);
-        }
-        corrTarget = constrain(uHold, -holdMaxEff, holdMaxEff);
-
-        if (yawHoldInPlaceMode) {
-          float absRawErr = fabsf(rawHeadingError);
-          float db = max(headingHoldDeadbandDeg, 0.1f);
-          float slowStart = max(yawHoldSlowdownStartDeg, db + 0.5f);
-          float finalCapDeg = constrain(yawHoldFinalCaptureDeg, db + 0.3f, slowStart - 0.1f);
-
-          float minCmd = 0.0f;
-          if (absRawErr > db) {
-            if (absRawErr >= slowStart) {
-              minCmd = yawHoldCruiseRpm;
-            } else if (absRawErr >= finalCapDeg) {
-              float t = (absRawErr - finalCapDeg) / (slowStart - finalCapDeg);
-              t = constrain(t, 0.0f, 1.0f);
-              minCmd = yawHoldFinalCaptureRpm + t * (yawHoldCruiseRpm - yawHoldFinalCaptureRpm);
-            } else {
-              float t = (absRawErr - db) / (finalCapDeg - db);
-              t = constrain(t, 0.0f, 1.0f);
-              minCmd = yawHoldFinalMinRpm + t * (yawHoldFinalCaptureRpm - yawHoldFinalMinRpm);
-            }
-          }
-
-          // Near target, cap authority to avoid violent cross-over oscillation.
-          if (absRawErr <= finalCapDeg) {
-            holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm, yawHoldFinalMinRpm + 0.6f));
-          } else if (absRawErr <= (finalCapDeg + 4.0f)) {
-            holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm + 0.8f, 4.5f));
-          }
-          corrTarget = constrain(corrTarget, -holdMaxEff, holdMaxEff);
-
-          // In large-error in-place turns, never command opposite turn direction.
-          if (absRawErr > (db + 1.0f)) {
-            int desiredSign = 0;
-            float signedErr = rawHeadingError * ((float)headingCorrSign);
-            if (signedErr > 0.0f) desiredSign = 1;
-            else if (signedErr < 0.0f) desiredSign = -1;
-            if (desiredSign != 0 && (corrTarget * ((float)desiredSign)) < 0.0f) {
-              corrTarget = 0.0f;
-            }
-          }
-
-          minCmd = constrain(minCmd, 0.0f, holdMaxEff);
-          bool enforceMin = absRawErr > (db + 0.3f) && headingHoldStableMs < headingHoldSettleHoldMs;
-          if (enforceMin && minCmd > 0.0f && fabsf(corrTarget) < minCmd) {
-            int sign = 0;
-            if (corrTarget > 0.0f) sign = 1;
-            else if (corrTarget < 0.0f) sign = -1;
-            else sign = (rawHeadingError >= 0.0f) ? 1 : -1;
-            corrTarget = ((float)sign) * minCmd;
-          }
-        }
-        debugCorrTargetRpm = corrTarget;
-
-        headingHoldPid.prevError = errHold;
-        headingHoldPid.out = corrTarget;
-      }
-
-      headingErrorDeg = rawHeadingError;
-      resetCascadePid(headingPid);
-    } else {
-      // If heading hold is disabled at stop, freeze target to current yaw.
-      if (positionDone && !holdHeadingAtStop) {
-        headingTargetDeg = imuYawDeg;
-        headingErrorDeg = 0.0f;
-      }
-      debugYawPhase = 0;
-      yawHoldInPlaceMode = false;
-      resetCascadePid(headingPid);
-      resetCascadePid(headingHoldPid);
-      headingHoldActive = false;
-      headingHoldStableMs = 0.0f;
-      corrTarget = 0.0f;
-    }
-
-    // Slew limiting suppresses command sign flapping and helps eliminate yaw chatter.
-    float slew = max(0.0f, headingCorrSlewRpmPerSec) * dt;
-    corr = headingCorrCmdPrev + constrain(corrTarget - headingCorrCmdPrev, -slew, slew);
-    if (holdPhase && !headingHoldActive) {
-      // In settled hold, drop correction immediately to avoid residual twitch.
-      corr = 0.0f;
-    }
-    headingCorrCmdPrev = corr;
-    debugCorrAfterSlewRpm = corr;
-  }
-  headingCorrRpm = corr;
-
-  if (poseMoveActive) {
-    if (poseMovePhase == 1) {
-      float absHeadingErr = fabsf(headingErrorDeg);
-      float absGyro = fabsf(imuGyroDpsFilt);
-      bool nearHeadingAndSlow = (absHeadingErr <= 3.0f) && (absGyro <= 3.0f);
-      bool closeHeadingBand = (absHeadingErr <= 5.0f);
-      if (nearHeadingAndSlow) {
-        poseMoveTurnNearMs += dt * 1000.0f;
-      } else {
-        poseMoveTurnNearMs = 0.0f;
-      }
-      if (closeHeadingBand) {
-        poseMoveTurnCloseMs += dt * 1000.0f;
-      } else {
-        poseMoveTurnCloseMs = 0.0f;
-      }
-
-      bool strictSettled = debugErrSettled && debugRateSettled && (headingHoldStableMs >= headingHoldSettleHoldMs);
-      bool nearSlowSettled = (poseMoveTurnNearMs >= 300.0f);
-      bool closeBandSettled = (poseMoveTurnCloseMs >= 1200.0f);
-      bool headingSettledNow = false;
-      if (poseMoveTurnOnly) {
-        // For pure turn commands, require tighter completion to avoid stopping several degrees short.
-        headingSettledNow = strictSettled || (nearSlowSettled && (absHeadingErr <= 2.2f));
-      } else {
-        headingSettledNow = strictSettled || nearSlowSettled || closeBandSettled;
-      }
-      if (headingSettledNow) {
-        if (poseMoveTurnOnly) {
-          // For zero-distance commands, complete immediately after turn settle.
-          controllerEnabled = false;
-          yawHoldInPlaceMode = false;
-          headingCorrCmdPrev = 0.0f;
-          stopAllMotors();
-          cancelPoseMove(1);
-          return;
-        }
-
-        // Start drive phase once heading is stably aligned.
-        poseMovePhase = 2;
-        poseMovePhaseStartMs = millis();
-        poseMoveTurnNearMs = 0.0f;
-        poseMoveTurnCloseMs = 0.0f;
-        yawHoldInPlaceMode = false;
-        headingCorrCmdPrev = 0.0f;
-        resetCascadePid(headingHoldPid);
-        positionTargetCounts = poseMoveTargetCounts;
-        positionDone = false;
-        positionDoneTicks = 0;
-        positionCmdRpm = 0.0f;
-        resetCascadePid(posPid);
-      }
-      if (poseMovePhase == 1 && poseMovePhaseStartMs != 0) {
-        uint32_t elapsed = millis() - poseMovePhaseStartMs;
-        if (elapsed > poseMoveTurnTimeoutMs) {
-          // Safety abort: heading failed to settle in turn phase.
-          controllerEnabled = false;
-          yawHoldInPlaceMode = false;
-          headingCorrCmdPrev = 0.0f;
-          stopAllMotors();
-          cancelPoseMove(2);
-          return;
-        }
-      }
-    } else if (poseMovePhase == 2) {
-      if (positionDone) {
-        controllerEnabled = false;
-        yawHoldInPlaceMode = false;
-        headingCorrCmdPrev = 0.0f;
-        stopAllMotors();
-        cancelPoseMove(1);
-        return;
-      }
-    }
-  }
-
-  // Right wheels: MOTA, MOTB. Left wheels: MOTD, MOTC.
-  targetRpm[0] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
-  targetRpm[1] = constrain(positionCmdRpm - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
-  targetRpm[2] = constrain(positionCmdRpm + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
-  targetRpm[3] = constrain(positionCmdRpm + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
 }
 
 void setupEncoderPin(uint8_t pin) {
@@ -1186,6 +576,11 @@ int32_t readEncoderCount(uint8_t idx) {
   return c;
 }
 
+int32_t readMotorSignedCount(uint8_t wheel) {
+  int32_t raw = readEncoderCount(motors[wheel].encIndex);
+  return rpmSign[wheel] * (-raw);
+}
+
 void resetEncoders() {
   noInterrupts();
   for (uint8_t i = 0; i < 4; i++) {
@@ -1198,26 +593,12 @@ void resetEncoders() {
     measuredRpmRaw[i] = 0.0f;
     measuredRpm[i] = 0.0f;
   }
-}
 
-void resetPidState(uint8_t i) {
-  pid[i].integral = 0.0f;
-  pid[i].prevError = 0.0f;
-  pid[i].out = 0.0f;
-}
-
-void resetAllPidStates() {
-  for (uint8_t i = 0; i < 4; i++) {
-    resetPidState(i);
-  }
+  bodyForwardCounts = 0.0f;
+  bodyStrafeCounts = 0.0f;
 }
 
 void setMotorPwmSigned(uint8_t wheel, int cmd) {
-  // Explicit signed mapping:
-  // cmd in [-255, +255]
-  // +cmd => IN1 PWM, IN2 = 0
-  // -cmd => IN1 = 0, IN2 PWM
-  // 0 => both 0
   cmd = constrain(cmd, -PWM_MAX, PWM_MAX);
   pwmCmd[wheel] = cmd;
 
@@ -1240,34 +621,6 @@ void stopAllMotors() {
   }
 }
 
-void stopRawMode() {
-  rawModeEnabled = false;
-  rawPwmCmd = 0;
-  stopAllMotors();
-}
-
-void startRawMode(int16_t cmd) {
-  if (minSweep.active) {
-    stopMinPwmSweep();
-  }
-
-  controllerEnabled = false;
-  updateTargets();
-  resetAllPidStates();
-
-  rawModeEnabled = true;
-  rawPwmCmd = (int16_t)constrain((int)cmd, -PWM_MAX, PWM_MAX);
-
-  stopAllMotors();
-  setMotorPwmSigned(activeWheel, rawPwmCmd);
-}
-
-void setAllWheelsPwmSigned(int cmd) {
-  for (uint8_t i = 0; i < 4; i++) {
-    setMotorPwmSigned(i, cmd);
-  }
-}
-
 void updateMeasuredRpm(float dt) {
   if (dt <= 0.0001f) {
     return;
@@ -1276,157 +629,632 @@ void updateMeasuredRpm(float dt) {
   const float rpmScale = (60.0f / COUNTS_PER_WHEEL_REV) / dt;
   float alpha = constrain(rpmFilterAlpha, 0.02f, 1.0f);
   for (uint8_t i = 0; i < 4; i++) {
-    // Keep measuredRpm[] in motor order by reading each motor's mapped encoder.
     const uint8_t encIdx = motors[i].encIndex;
     int32_t countNow = readEncoderCount(encIdx);
     int32_t delta = countNow - lastEncoderCount[encIdx];
     lastEncoderCount[encIdx] = countNow;
-
-    // Per-wheel RPM sign lets you align measured RPM with your chosen target convention.
     measuredRpmRaw[i] = ((float)rpmSign[i]) * (-((float)delta) * rpmScale);
     measuredRpm[i] += alpha * (measuredRpmRaw[i] - measuredRpm[i]);
   }
 }
 
-void stopMinPwmSweep() {
-  minSweep.active = false;
-  minSweep.stableMoveTicks = 0;
-  minSweep.avgAbsRpm = 0.0f;
-  stopAllMotors();
+void updateBodyCounts() {
+  float br = (float)readMotorSignedCount(0);
+  float fr = (float)readMotorSignedCount(1);
+  float bl = (float)readMotorSignedCount(2);
+  float fl = (float)readMotorSignedCount(3);
+  bodyForwardCounts = 0.25f * (br + fr + bl + fl);
+  bodyStrafeCounts = 0.25f * (-br + fr + bl - fl);
 }
 
-void startMinPwmSweep(int8_t direction, uint8_t startPwm, uint8_t endPwm, uint8_t stepPwm, uint16_t holdMs) {
-  direction = (direction >= 0) ? 1 : -1;
-
-  startPwm = constrain(startPwm, MIN_SWEEP_MIN_PWM, MIN_SWEEP_MAX_PWM);
-  endPwm = constrain(endPwm, MIN_SWEEP_MIN_PWM, MIN_SWEEP_MAX_PWM);
-  if (endPwm < startPwm) {
-    uint8_t t = startPwm;
-    startPwm = endPwm;
-    endPwm = t;
-  }
-
-  stepPwm = constrain(stepPwm, (uint8_t)1, (uint8_t)20);
-  holdMs = constrain((int)holdMs, 200, 3000);
-
-  controllerEnabled = false;
-  updateTargets();
-  resetAllPidStates();
-  resetEncoders();
-
-  minSweep.active = true;
-  minSweep.direction = direction;
-  minSweep.startPwm = startPwm;
-  minSweep.endPwm = endPwm;
-  minSweep.stepPwm = stepPwm;
-  minSweep.holdMs = holdMs;
-  minSweep.currentPwm = startPwm;
-  minSweep.detectedPwm = 0;
-  minSweep.stableMoveTicks = 0;
-  minSweep.avgAbsRpm = 0.0f;
-  minSweep.stepStartMs = millis();
-
-  int signedPwm = ((int)minSweep.currentPwm) * ((minSweep.direction > 0) ? 1 : -1);
-  setAllWheelsPwmSigned(signedPwm);
+float computeMoveProgressCounts() {
+  float dForward = bodyForwardCounts - activeMoveStartForwardCounts;
+  float dStrafe = bodyStrafeCounts - activeMoveStartStrafeCounts;
+  return dForward * activeMoveDirForward + dStrafe * activeMoveDirStrafe;
 }
 
-void updateMinPwmSweep(uint32_t now) {
-  if (!minSweep.active) {
-    return;
-  }
+float computeMoveCrossTrackCounts() {
+  float dForward = bodyForwardCounts - activeMoveStartForwardCounts;
+  float dStrafe = bodyStrafeCounts - activeMoveStartStrafeCounts;
+  return -dForward * activeMoveDirStrafe + dStrafe * activeMoveDirForward;
+}
 
-  float sumAbs = 0.0f;
+void computeMoveMix(float angleDeg) {
+  float rad = angleDeg * DEG_TO_RAD;
+  activeMoveDirForward = cosf(rad);
+  activeMoveDirStrafe = MOVE_STRAFE_SIGN * sinf(rad);
+
+  float mix[4] = {
+    activeMoveDirForward - activeMoveDirStrafe,
+    activeMoveDirForward + activeMoveDirStrafe,
+    activeMoveDirForward + activeMoveDirStrafe,
+    activeMoveDirForward - activeMoveDirStrafe,
+  };
+
+  float maxAbs = 1.0f;
   for (uint8_t i = 0; i < 4; i++) {
-    sumAbs += fabsf(measuredRpm[i]);
+    maxAbs = max(maxAbs, fabsf(mix[i]));
   }
-  minSweep.avgAbsRpm = sumAbs / 4.0f;
-
-  if (minSweep.detectedPwm == 0) {
-    if (minSweep.avgAbsRpm >= minSweep.detectRpmThreshold) {
-      if (minSweep.stableMoveTicks < 255) {
-        minSweep.stableMoveTicks++;
-      }
-    } else {
-      minSweep.stableMoveTicks = 0;
-    }
-
-    if (minSweep.stableMoveTicks >= 3) {
-      minSweep.detectedPwm = minSweep.currentPwm;
-    }
+  for (uint8_t i = 0; i < 4; i++) {
+    activeMoveMix[i] = mix[i] / maxAbs;
   }
-
-  if (now - minSweep.stepStartMs < minSweep.holdMs) {
-    return;
-  }
-
-  uint16_t nextPwm = (uint16_t)minSweep.currentPwm + (uint16_t)minSweep.stepPwm;
-  if (nextPwm > minSweep.endPwm) {
-    stopMinPwmSweep();
-    return;
-  }
-
-  minSweep.currentPwm = (uint8_t)nextPwm;
-  minSweep.stableMoveTicks = 0;
-  minSweep.stepStartMs = now;
-
-  int signedPwm = ((int)minSweep.currentPwm) * ((minSweep.direction > 0) ? 1 : -1);
-  setAllWheelsPwmSigned(signedPwm);
 }
 
-void updateTargets() {
+const char* resultCodeText(uint8_t code) {
+  switch (code) {
+    case 1: return "completed";
+    case 2: return "stopped";
+    case 3: return "turn_timeout";
+    case 4: return "imu_missing";
+    case 5: return "twist_timeout";
+    default: return "idle";
+  }
+}
+
+const char* commandModeText() {
+  if (commandMode == CMD_TWIST) {
+    return "twist";
+  }
+  if (commandMode == CMD_SEQUENCE) {
+    if (movePhase == MOVE_TURNING) return "turning";
+    if (movePhase == MOVE_DRIVING) return "driving";
+  }
+  return "idle";
+}
+
+void queueDoneEvent(uint32_t seq, uint8_t code) {
+  pendingDoneEvent = true;
+  pendingDoneSeq = seq;
+  pendingDoneCode = code;
+}
+
+void clearTargets() {
   for (uint8_t i = 0; i < 4; i++) {
     targetRpm[i] = 0.0f;
   }
-  if (controllerEnabled && controlMode == MODE_SINGLE_WHEEL_VELOCITY) {
-    targetRpm[activeWheel] = pidTargetRpm;
+}
+
+void cancelActiveCommand(uint8_t resultCode) {
+  if (commandMode != CMD_IDLE && activeSeq != 0) {
+    queueDoneEvent(activeSeq, resultCode);
+  }
+  commandMode = CMD_IDLE;
+  movePhase = MOVE_IDLE;
+  controllerEnabled = false;
+  yawHoldInPlaceMode = false;
+  activeMoveTurnOnly = false;
+  twistTimeoutMs = 0;
+  clearTargets();
+  headingCorrCmdPrev = 0.0f;
+  resetHighLevelControllers();
+  stopAllMotors();
+  activeSeq = 0;
+}
+
+void finishSequence(uint8_t resultCode) {
+  uint32_t seq = activeSeq;
+  commandMode = CMD_IDLE;
+  movePhase = MOVE_IDLE;
+  controllerEnabled = false;
+  yawHoldInPlaceMode = false;
+  clearTargets();
+  headingCorrCmdPrev = 0.0f;
+  stopAllMotors();
+  if (seq != 0) {
+    queueDoneEvent(seq, resultCode);
+  }
+  activeSeq = 0;
+}
+
+void sendJsonLine(const String& line) {
+  SERIAL_LOCK();
+  Serial.println(line);
+  SERIAL_UNLOCK();
+}
+
+String buildTelemetryJson() {
+  String s;
+  float progressCm = countsToCm(positionCurrentCounts);
+  float remainingCm = countsToCm(positionErrorCounts);
+  float crossTrackCm = countsToCm(computeMoveCrossTrackCounts());
+  s.reserve(560);
+  s += "{\"type\":\"telemetry\"";
+  s += ",\"mode\":\"" + String(commandModeText()) + "\"";
+  s += ",\"seq\":" + String(activeSeq);
+  s += ",\"imu\":{\"ok\":" + String(imuOk ? "true" : "false");
+  s += ",\"yawDeg\":" + String(imuYawDeg, 3);
+  s += ",\"gyroDps\":" + String(imuGyroDps, 3);
+  s += ",\"accXg\":" + String(imuAccXg, 4);
+  s += ",\"accYg\":" + String(imuAccYg, 4);
+  s += ",\"accXYg\":" + String(imuAccXYg, 4);
+  s += "}";
+  s += ",\"pose\":{\"forwardCm\":" + String(countsToCm(bodyForwardCounts), 2);
+  s += ",\"strafeCm\":" + String(countsToCm(bodyStrafeCounts), 2);
+  s += ",\"progressCm\":" + String(progressCm, 2);
+  s += ",\"remainingCm\":" + String(remainingCm, 2);
+  s += ",\"crossTrackCm\":" + String(crossTrackCm, 2);
+  s += "}";
+  s += ",\"move\":{\"phase\":" + String((int)movePhase);
+  s += ",\"angleDeg\":" + String(activeMoveAngleDeg, 2);
+  s += ",\"distanceCm\":" + String(activeMoveDistanceCm, 2);
+  s += ",\"headingTargetDeg\":" + String(headingTargetDeg, 2);
+  s += ",\"headingErrorDeg\":" + String(headingErrorDeg, 2);
+  s += ",\"done\":" + String(positionDone ? "true" : "false");
+  s += "}";
+  s += ",\"rpm\":[" + String(measuredRpm[0], 2) + "," + String(measuredRpm[1], 2) + "," + String(measuredRpm[2], 2) + "," + String(measuredRpm[3], 2) + "]";
+  s += ",\"targetRpm\":[" + String(targetRpm[0], 2) + "," + String(targetRpm[1], 2) + "," + String(targetRpm[2], 2) + "," + String(targetRpm[3], 2) + "]";
+  s += ",\"pwm\":[" + String(pwmCmd[0]) + "," + String(pwmCmd[1]) + "," + String(pwmCmd[2]) + "," + String(pwmCmd[3]) + "]";
+  s += ",\"rawEncoderCounts\":[" + String(readEncoderCount(motors[0].encIndex)) + "," + String(readEncoderCount(motors[1].encIndex)) + "," + String(readEncoderCount(motors[2].encIndex)) + "," + String(readEncoderCount(motors[3].encIndex)) + "]";
+  s += ",\"signedEncoderCounts\":[" + String(readMotorSignedCount(0)) + "," + String(readMotorSignedCount(1)) + "," + String(readMotorSignedCount(2)) + "," + String(readMotorSignedCount(3)) + "]";
+  s += "}";
+  return s;
+}
+
+String buildDoneJson(uint32_t seq, uint8_t code) {
+  String s;
+  s.reserve(260);
+  s += "{\"type\":\"done\",\"seq\":" + String(seq);
+  s += ",\"result\":\"" + String(resultCodeText(code)) + "\"";
+  s += ",\"headingDeg\":" + String(imuYawDeg, 2);
+  s += ",\"forwardCm\":" + String(countsToCm(bodyForwardCounts), 2);
+  s += ",\"strafeCm\":" + String(countsToCm(bodyStrafeCounts), 2);
+  s += ",\"progressCm\":" + String(countsToCm(positionCurrentCounts), 2);
+  s += "}";
+  return s;
+}
+
+String buildAckJson(uint32_t seq, const char* cmd, bool ok, const String& message) {
+  String s;
+  s.reserve(220);
+  s += "{\"type\":\"ack\",\"seq\":" + String(seq);
+  s += ",\"cmd\":\"" + String(cmd) + "\"";
+  s += ",\"ok\":" + String(ok ? "true" : "false");
+  s += ",\"message\":\"" + message + "\"}";
+  return s;
+}
+
+void normalizeMoveRequest(float& angleDeg, float& distCm) {
+  if (distCm < 0.0f) {
+    distCm = -distCm;
+    angleDeg = wrapAngleDeg(angleDeg + 180.0f);
+  }
+  angleDeg = wrapAngleDeg(angleDeg);
+}
+
+void startMoveSequence(uint32_t seq, float angleDeg, float distCm, float cruiseRpm, float headingDeg, uint32_t timeoutMs) {
+  normalizeMoveRequest(angleDeg, distCm);
+  cancelActiveCommand(2);
+
+  activeSeq = seq;
+  activeMoveAngleDeg = angleDeg;
+  activeMoveDistanceCm = distCm;
+  activeMoveCruiseRpm = constrain(cruiseRpm, posFinalMinRpm, POSITION_RPM_MAX);
+  activeTurnMaxRpm = constrain(cruiseRpm, headingHoldMaxRpm, TARGET_RPM_MAX);
+  activeMoveRequestedYawDeg = wrapAngleDeg(headingDeg);
+  activeMoveAppliedYawDeg = 0.0f;
+  headingTargetDeg = applyTurnOvershootComp(activeMoveRequestedYawDeg, imuYawDeg, turnOvershootDeg, &activeMoveAppliedYawDeg);
+
+  updateBodyCounts();
+  activeMoveStartForwardCounts = bodyForwardCounts;
+  activeMoveStartStrafeCounts = bodyStrafeCounts;
+
+  activeMoveAppliedDistBiasCm = (distCm > 0.0f) ? computeDistanceCompCm(distCm) : 0.0f;
+  activeMoveTargetCounts = cmToCounts(distCm + activeMoveAppliedDistBiasCm);
+  activeMoveTurnOnly = distCm <= 0.5f;
+  activeMoveTurnTimeoutMs = timeoutMs > 0 ? constrain(timeoutMs, 2000UL, 30000UL) : computePoseTurnTimeoutMs(headingTargetDeg, imuYawDeg, activeTurnMaxRpm);
+  activeMovePhaseStartMs = millis();
+  movePhase = MOVE_TURNING;
+  commandMode = CMD_SEQUENCE;
+  controllerEnabled = true;
+  holdHeadingAtStop = true;
+  yawHoldInPlaceMode = true;
+  computeMoveMix(activeMoveAngleDeg);
+  resetHighLevelControllers();
+  positionDone = true;
+  positionDoneTicks = 5;
+}
+
+void startTwist(uint32_t seq, float forwardRpm, float strafeRpm, float turnRpm, uint32_t timeoutMs) {
+  cancelActiveCommand(2);
+  activeSeq = seq;
+  commandMode = CMD_TWIST;
+  movePhase = MOVE_IDLE;
+  controllerEnabled = false;
+  yawHoldInPlaceMode = false;
+  twistForwardRpm = constrain(forwardRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  twistStrafeRpm = constrain(strafeRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  twistTurnRpm = constrain(turnRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  twistTimeoutMs = constrain(timeoutMs, 100UL, 60000UL);
+  twistStartMs = millis();
+  resetHighLevelControllers();
+}
+
+void updateTwistTargets() {
+  clearTargets();
+  targetRpm[0] = constrain(twistForwardRpm - twistStrafeRpm - twistTurnRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[1] = constrain(twistForwardRpm + twistStrafeRpm - twistTurnRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[2] = constrain(twistForwardRpm + twistStrafeRpm + twistTurnRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[3] = constrain(twistForwardRpm - twistStrafeRpm + twistTurnRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+
+  if (twistTimeoutMs > 0 && (millis() - twistStartMs) >= twistTimeoutMs) {
+    uint32_t seq = activeSeq;
+    commandMode = CMD_IDLE;
+    clearTargets();
+    stopAllMotors();
+    if (seq != 0) {
+      queueDoneEvent(seq, 5);
+    }
+    activeSeq = 0;
   }
 }
 
-void runControlLoop(float dt) {
-  updateMeasuredRpm(dt);
-  imuUpdate(dt);
-  updateHighLevelTargets(dt);
-  updateSlipDetector(dt);
+void updateHighLevelTargets(float dt) {
+  clearTargets();
+  debugYawPhase = 0;
+  debugErrSettled = false;
+  debugRateSettled = false;
+  debugRawHeadingErrDeg = 0.0f;
+  debugUsedHeadingErrDeg = 0.0f;
 
-  if (slipEnabled && slipDetected) {
-    float lim = constrain(slipMaxRpm, 0.0f, TARGET_RPM_MAX);
+  if (!controllerEnabled || commandMode != CMD_SEQUENCE) {
+    return;
+  }
+
+  updateBodyCounts();
+  if (movePhase == MOVE_TURNING) {
+    yawHoldInPlaceMode = true;
+    holdHeadingAtStop = true;
+  }
+
+  if (yawHoldInPlaceMode) {
+    positionCurrentCounts = 0.0f;
+    positionErrorCounts = 0.0f;
+    positionDone = true;
+    positionDoneTicks = 5;
+    positionCmdRpm = 0.0f;
+    posCmdPrevRpm = 0.0f;
+    posPid.out = 0.0f;
+    resetCascadePid(posPid);
+  } else {
+    positionCurrentCounts = computeMoveProgressCounts();
+    positionErrorCounts = activeMoveTargetCounts - positionCurrentCounts;
+
+    float positionErrorCm = countsToCm(positionErrorCounts);
+    float absPositionErrCm = fabsf(positionErrorCm);
+    float avgAbsWheelRpm = 0.0f;
     for (uint8_t i = 0; i < 4; i++) {
-      targetRpm[i] = constrain(targetRpm[i], -lim, lim);
+      avgAbsWheelRpm += fabsf(measuredRpm[i]);
+    }
+    avgAbsWheelRpm *= 0.25f;
+
+    float doneTolCm = constrain(posDoneTolCm, 0.2f, max(2.0f, positionTolCm));
+    bool nearPosTol = absPositionErrCm <= min(positionTolCm, doneTolCm);
+    bool wheelSettled = avgAbsWheelRpm <= max(0.4f, posDoneMaxWheelRpm);
+    if (nearPosTol && wheelSettled) {
+      if (positionDoneTicks < 255) positionDoneTicks++;
+    } else {
+      positionDoneTicks = 0;
+    }
+    positionDone = (positionDoneTicks >= 8);
+
+    float iBandCm = max(positionTolCm + 0.2f, posIntegralBandCm);
+    if (!positionDone && absPositionErrCm <= iBandCm) {
+      posPid.integral += positionErrorCounts * dt;
+      posPid.integral = constrain(posPid.integral, -30000.0f, 30000.0f);
+    } else {
+      posPid.integral *= 0.85f;
+      if (absPositionErrCm > (iBandCm + 5.0f)) {
+        posPid.integral = 0.0f;
+      }
+    }
+
+    float posDeriv = (positionErrorCounts - posPid.prevError) / dt;
+    posPid.prevError = positionErrorCounts;
+
+    float base = posPid.kp * positionErrorCounts + posPid.ki * posPid.integral + posPid.kd * posDeriv;
+
+    float cruiseRpm = constrain(activeMoveCruiseRpm, 0.0f, TARGET_RPM_MAX);
+    float finalMinRpm = constrain(posFinalMinRpm, 0.0f, cruiseRpm);
+    float finalWinCm = max(positionTolCm + 0.1f, posFinalWindowCm);
+    float slowStartCm = max(finalWinCm + 0.2f, posSlowdownStartCm);
+    float profileMaxRpm = cruiseRpm;
+    if (absPositionErrCm <= slowStartCm) {
+      float t = (absPositionErrCm - finalWinCm) / max(0.2f, (slowStartCm - finalWinCm));
+      t = constrain(t, 0.0f, 1.0f);
+      profileMaxRpm = finalMinRpm + t * (cruiseRpm - finalMinRpm);
+    }
+    profileMaxRpm = constrain(profileMaxRpm, finalMinRpm, cruiseRpm);
+    base = constrain(base, -profileMaxRpm, profileMaxRpm);
+
+    if (!positionDone && absPositionErrCm > (positionTolCm + 0.3f) && fabsf(base) < finalMinRpm) {
+      base = (positionErrorCm >= 0.0f ? 1.0f : -1.0f) * finalMinRpm;
+    }
+
+    float noReverseBand = max(0.25f, min(posNoReverseBandCm, max(0.6f, positionTolCm * 0.9f)));
+    if (absPositionErrCm <= noReverseBand && (base * positionErrorCm) < 0.0f) {
+      base = 0.0f;
+      posPid.integral = 0.0f;
+    }
+
+    if (positionDone) {
+      base = 0.0f;
+    }
+
+    float posSlew = max(0.0f, posCmdSlewRpmPerSec) * dt;
+    float cmd = posCmdPrevRpm + constrain(base - posCmdPrevRpm, -posSlew, posSlew);
+    if (positionDone) {
+      cmd = 0.0f;
+    }
+
+    posCmdPrevRpm = cmd;
+    posPid.out = cmd;
+    positionCmdRpm = cmd;
+  }
+
+  float corr = 0.0f;
+  headingErrorDeg = 0.0f;
+  if (imuOk) {
+    float rawHeadingError = shortestAngleErrorDeg(headingTargetDeg, imuYawDeg);
+    debugRawHeadingErrDeg = rawHeadingError;
+    bool movingPhase = !positionDone;
+    bool holdPhase = positionDone && holdHeadingAtStop;
+    float corrTarget = 0.0f;
+
+    if (movingPhase) {
+      debugYawPhase = 1;
+      float errMove = rawHeadingError;
+      float moveDb = constrain(headingMoveDeadbandDeg, 0.0f, 10.0f);
+      if (fabsf(errMove) <= moveDb) {
+        errMove = 0.0f;
+      } else if (errMove > 0.0f) {
+        errMove -= moveDb;
+      } else {
+        errMove += moveDb;
+      }
+      debugUsedHeadingErrDeg = errMove;
+
+      float uMove = headingPid.kp * errMove - headingPid.kd * imuGyroDpsFilt;
+      float moveKiBand = max(moveDb + 0.2f, headingMoveKiErrBandDeg);
+      if (fabsf(headingPid.ki) > 0.0001f && fabsf(errMove) < moveKiBand) {
+        headingPid.integral += errMove * dt;
+        headingPid.integral = constrain(headingPid.integral, -40.0f, 40.0f);
+        uMove += headingPid.ki * headingPid.integral;
+      } else {
+        headingPid.integral = 0.0f;
+      }
+
+      uMove *= (float)headingCorrSign;
+      corrTarget = constrain(uMove, -headingCorrMaxRpm, headingCorrMaxRpm);
+      headingPid.prevError = errMove;
+      headingPid.out = corrTarget;
+      headingErrorDeg = errMove;
+
+      resetCascadePid(headingHoldPid);
+      headingHoldActive = false;
+      headingHoldStableMs = 0.0f;
+    } else if (holdPhase) {
+      float errAbs = fabsf(rawHeadingError);
+      float rateAbs = fabsf(imuGyroDpsFilt);
+      float errEnter = max(headingHoldDeadbandDeg, 0.05f);
+      float rateEnter = max(headingHoldExitRateDps, 0.05f);
+      float errExit = errEnter + 0.6f;
+      float rateExit = rateEnter + 0.8f;
+
+      if (!yawHoldInPlaceMode) {
+        errEnter = min(errEnter, 0.55f);
+        errExit = errEnter + 0.25f;
+        rateEnter = min(rateEnter, 1.8f);
+        rateExit = rateEnter + 0.5f;
+      }
+
+      if (headingErrSettledLatch) {
+        headingErrSettledLatch = errAbs <= errExit;
+      } else {
+        headingErrSettledLatch = errAbs <= errEnter;
+      }
+
+      if (headingRateSettledLatch) {
+        headingRateSettledLatch = rateAbs <= rateExit;
+      } else {
+        headingRateSettledLatch = rateAbs <= rateEnter;
+      }
+
+      bool errSettled = headingErrSettledLatch;
+      bool rateSettled = headingRateSettledLatch;
+      debugErrSettled = errSettled;
+      debugRateSettled = rateSettled;
+
+      if (errSettled && rateSettled) {
+        debugYawPhase = 3;
+        headingHoldStableMs += dt * 1000.0f;
+        if (headingHoldStableMs >= headingHoldSettleHoldMs) {
+          corrTarget = 0.0f;
+          debugUsedHeadingErrDeg = 0.0f;
+          headingHoldActive = false;
+          resetCascadePid(headingHoldPid);
+        }
+      } else {
+        debugYawPhase = 2;
+        headingHoldStableMs = 0.0f;
+        headingHoldActive = true;
+
+        float errHold = rawHeadingError;
+        if (fabsf(errHold) <= headingHoldDeadbandDeg) {
+          errHold = 0.0f;
+        } else if (errHold > 0.0f) {
+          errHold -= headingHoldDeadbandDeg;
+        } else {
+          errHold += headingHoldDeadbandDeg;
+        }
+        debugUsedHeadingErrDeg = errHold;
+
+        float uHold = headingHoldPid.kp * errHold - headingHoldPid.kd * imuGyroDpsFilt;
+        float holdKiEff = headingHoldPid.ki;
+        float holdKiErrBand = 6.0f;
+        if (yawHoldInPlaceMode) {
+          holdKiEff *= yawHoldInPlaceKiScale;
+          holdKiErrBand = max(4.0f, yawHoldInPlaceKiErrDeg);
+        }
+        if (fabsf(holdKiEff) > 0.0001f && fabsf(errHold) < holdKiErrBand) {
+          headingHoldPid.integral += errHold * dt;
+          float iLim = yawHoldInPlaceMode ? 24.0f : 20.0f;
+          headingHoldPid.integral = constrain(headingHoldPid.integral, -iLim, iLim);
+          uHold += holdKiEff * headingHoldPid.integral;
+        } else {
+          headingHoldPid.integral = 0.0f;
+        }
+
+        uHold *= (float)headingCorrSign;
+
+        float holdMaxEff = yawHoldInPlaceMode ? activeTurnMaxRpm : min(headingHoldMaxRpm, 3.2f);
+        corrTarget = constrain(uHold, -holdMaxEff, holdMaxEff);
+
+        if (yawHoldInPlaceMode) {
+          float absRawErr = fabsf(rawHeadingError);
+          float db = max(headingHoldDeadbandDeg, 0.1f);
+          float slowStart = max(yawHoldSlowdownStartDeg, db + 0.5f);
+          float finalCapDeg = constrain(yawHoldFinalCaptureDeg, db + 0.3f, slowStart - 0.1f);
+          float minCmd = 0.0f;
+          float tunedCruiseRpm = min(yawHoldCruiseRpm, activeTurnMaxRpm);
+
+          if (absRawErr > db) {
+            if (absRawErr >= slowStart) {
+              minCmd = tunedCruiseRpm;
+            } else if (absRawErr >= finalCapDeg) {
+              float t = (absRawErr - finalCapDeg) / (slowStart - finalCapDeg);
+              t = constrain(t, 0.0f, 1.0f);
+              minCmd = yawHoldFinalCaptureRpm + t * (tunedCruiseRpm - yawHoldFinalCaptureRpm);
+            } else {
+              float t = (absRawErr - db) / (finalCapDeg - db);
+              t = constrain(t, 0.0f, 1.0f);
+              minCmd = yawHoldFinalMinRpm + t * (yawHoldFinalCaptureRpm - yawHoldFinalMinRpm);
+            }
+          }
+
+          if (absRawErr <= finalCapDeg) {
+            holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm, yawHoldFinalMinRpm + 0.6f));
+          } else if (absRawErr <= (finalCapDeg + 4.0f)) {
+            holdMaxEff = min(holdMaxEff, max(yawHoldFinalCaptureRpm + 0.8f, 4.5f));
+          }
+          corrTarget = constrain(corrTarget, -holdMaxEff, holdMaxEff);
+
+          if (absRawErr > (db + 1.0f)) {
+            int desiredSign = 0;
+            float signedErr = rawHeadingError * ((float)headingCorrSign);
+            if (signedErr > 0.0f) desiredSign = 1;
+            else if (signedErr < 0.0f) desiredSign = -1;
+            if (desiredSign != 0 && (corrTarget * ((float)desiredSign)) < 0.0f) {
+              corrTarget = 0.0f;
+            }
+          }
+
+          minCmd = constrain(minCmd, 0.0f, holdMaxEff);
+          bool enforceMin = absRawErr > (db + 0.3f) && headingHoldStableMs < headingHoldSettleHoldMs;
+          if (enforceMin && minCmd > 0.0f && fabsf(corrTarget) < minCmd) {
+            int sign = 0;
+            if (corrTarget > 0.0f) sign = 1;
+            else if (corrTarget < 0.0f) sign = -1;
+            else sign = (rawHeadingError >= 0.0f) ? 1 : -1;
+            corrTarget = ((float)sign) * minCmd;
+          }
+        }
+
+        headingHoldPid.prevError = errHold;
+        headingHoldPid.out = corrTarget;
+      }
+
+      headingErrorDeg = rawHeadingError;
+      resetCascadePid(headingPid);
+    } else {
+      resetCascadePid(headingPid);
+      resetCascadePid(headingHoldPid);
+      headingHoldActive = false;
+      headingHoldStableMs = 0.0f;
+      corrTarget = 0.0f;
+    }
+
+    float slew = max(0.0f, headingCorrSlewRpmPerSec) * dt;
+    corr = headingCorrCmdPrev + constrain(corrTarget - headingCorrCmdPrev, -slew, slew);
+    if (holdPhase && !headingHoldActive) {
+      corr = 0.0f;
+    }
+    headingCorrCmdPrev = corr;
+  }
+  headingCorrRpm = corr;
+
+  if (movePhase == MOVE_TURNING) {
+    float absHeadingErr = fabsf(headingErrorDeg);
+    float absGyro = fabsf(imuGyroDpsFilt);
+    bool nearHeadingAndSlow = (absHeadingErr <= 3.0f) && (absGyro <= 3.0f);
+    bool closeHeadingBand = (absHeadingErr <= 5.0f);
+    if (nearHeadingAndSlow) {
+      activeMoveTurnNearMs += dt * 1000.0f;
+    } else {
+      activeMoveTurnNearMs = 0.0f;
+    }
+    if (closeHeadingBand) {
+      activeMoveTurnCloseMs += dt * 1000.0f;
+    } else {
+      activeMoveTurnCloseMs = 0.0f;
+    }
+
+    bool strictSettled = debugErrSettled && debugRateSettled && (headingHoldStableMs >= headingHoldSettleHoldMs);
+    bool nearSlowSettled = (activeMoveTurnNearMs >= 300.0f);
+    bool closeBandSettled = (activeMoveTurnCloseMs >= 1200.0f);
+    bool headingSettledNow = activeMoveTurnOnly ? (strictSettled || (nearSlowSettled && (absHeadingErr <= 2.2f))) : (strictSettled || nearSlowSettled || closeBandSettled);
+
+    if (headingSettledNow) {
+      if (activeMoveTurnOnly) {
+        finishSequence(1);
+        return;
+      }
+
+      movePhase = MOVE_DRIVING;
+      activeMovePhaseStartMs = millis();
+      activeMoveTurnNearMs = 0.0f;
+      activeMoveTurnCloseMs = 0.0f;
+      yawHoldInPlaceMode = false;
+      headingCorrCmdPrev = 0.0f;
+      resetCascadePid(headingHoldPid);
+      positionDone = false;
+      positionDoneTicks = 0;
+      positionCmdRpm = 0.0f;
+      posCmdPrevRpm = 0.0f;
+      resetCascadePid(posPid);
+    }
+
+    if (movePhase == MOVE_TURNING && activeMovePhaseStartMs != 0) {
+      uint32_t elapsed = millis() - activeMovePhaseStartMs;
+      if (elapsed > activeMoveTurnTimeoutMs) {
+        finishSequence(3);
+        return;
+      }
+    }
+  } else if (movePhase == MOVE_DRIVING) {
+    if (positionDone) {
+      finishSequence(1);
+      return;
     }
   }
 
-  bool yawHoldWheelMode = (controlMode == MODE_POSITION_HEADING) && (fabsf(positionCmdRpm) < headingEnableBaseRpm) && (headingHoldActive || yawHoldInPlaceMode);
+  targetRpm[0] = constrain(positionCmdRpm * activeMoveMix[0] - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[1] = constrain(positionCmdRpm * activeMoveMix[1] - headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[2] = constrain(positionCmdRpm * activeMoveMix[2] + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+  targetRpm[3] = constrain(positionCmdRpm * activeMoveMix[3] + headingCorrRpm, -TARGET_RPM_MAX, TARGET_RPM_MAX);
+}
+
+void runWheelPid(float dt) {
+  bool yawHoldWheelMode = controllerEnabled && (fabsf(positionCmdRpm) < headingEnableBaseRpm) && (headingHoldActive || yawHoldInPlaceMode);
 
   for (uint8_t i = 0; i < 4; i++) {
     float target = targetRpm[i];
-
-    bool translationMode = (controlMode == MODE_POSITION_HEADING) && !yawHoldInPlaceMode;
-    if (translationMode && !encoderHealthy[i]) {
-      // Use bounded open-loop fallback to avoid a dead encoder forcing max PWM forever.
-      resetPidState(i);
-      debugWheelErr[i] = 0.0f;
-      debugWheelPidOut[i] = 0.0f;
-      debugWheelCmdPreBreakaway[i] = 0;
-      int cmd = (int)lroundf(target * encoderFallbackPwmPerRpm);
-      cmd = constrain(cmd, -encoderFallbackPwmMax, encoderFallbackPwmMax);
-      if (fabsf(target) < 0.8f) {
-        cmd = 0;
-      }
-      setMotorPwmSigned(i, cmd);
-      continue;
-    }
-
     if (yawHoldWheelMode && fabsf(target) < yawHoldTargetDeadbandRpm) {
       target = 0.0f;
     }
 
     float err = target - measuredRpm[i];
-    debugWheelErr[i] = err;
-
     if (fabsf(target) < 0.01f) {
       resetPidState(i);
-      debugWheelPidOut[i] = 0.0f;
-      debugWheelCmdPreBreakaway[i] = 0;
       yawHoldWheelCmdPrev[i] = 0;
       setMotorPwmSigned(i, 0);
       continue;
@@ -1450,7 +1278,6 @@ void runControlLoop(float dt) {
 
     float u = kpEff * err + kiEff * pid[i].integral + kdEff * deriv;
     pid[i].out = u;
-    debugWheelPidOut[i] = u;
 
     int cmd = (int)lroundf(u);
     int maxPwm = yawHoldWheelMode ? constrain((int)yawHoldWheelPwmMax, 0, PWM_MAX) : PWM_MAX;
@@ -1464,8 +1291,6 @@ void runControlLoop(float dt) {
     }
     cmd = constrain(cmd, -maxPwm, maxPwm);
 
-    // Basic anti-windup: if saturated and the error would push further into saturation,
-    // roll back this cycle's integral contribution.
     bool satHigh = (cmd >= maxPwm - 1) && (err > 0.0f);
     bool satLow = (cmd <= -maxPwm + 1) && (err < 0.0f);
     if (kiEff > 0.0f && (satHigh || satLow)) {
@@ -1473,10 +1298,7 @@ void runControlLoop(float dt) {
       pid[i].integral = constrain(pid[i].integral, -300.0f, 300.0f);
     }
 
-    debugWheelCmdPreBreakaway[i] = (int16_t)cmd;
-
-    // Breakaway MinPWM is applied only during translation.
-    bool translationalMotion = !(controlMode == MODE_POSITION_HEADING && fabsf(positionCmdRpm) < headingEnableBaseRpm);
+    bool translationalMotion = !(controllerEnabled && fabsf(positionCmdRpm) < headingEnableBaseRpm);
     bool wantsMotion = fabsf(target) > 0.8f;
     bool wheelNearlyStopped = fabsf(measuredRpm[i]) < 1.0f;
     int breakawayPwm = translationalMotion ? (int)minPwm : 0;
@@ -1488,7 +1310,6 @@ void runControlLoop(float dt) {
       cmd = sign * breakawayPwm;
     }
 
-    // In yaw hold, allow a modest kick only when far from target and nearly stalled.
     if (yawHoldWheelMode && yawHoldInPlaceMode) {
       bool farFromTarget = fabsf(debugRawHeadingErrDeg) >= yawHoldBreakawayErrDeg;
       bool stalled = fabsf(measuredRpm[i]) < 0.8f;
@@ -1514,1762 +1335,281 @@ void runControlLoop(float dt) {
 
     setMotorPwmSigned(i, cmd);
   }
-
-  updateEncoderHealth(dt);
 }
 
-String pageHtml() {
-  return R"HTML(
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-<meta http-equiv="Pragma" content="no-cache" />
-<meta http-equiv="Expires" content="0" />
-<title>Wheel PID Tuner</title>
-<style>
-:root{--bg:#0b1220;--panel:#111827;--line:#293548;--txt:#e5e7eb;--muted:#9ca3af;--ok:#16a34a;--warn:#f59e0b;}
-body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:radial-gradient(circle at top,#101a30,#0b1220 60%);color:var(--txt)}
-.wrap{max-width:980px;margin:18px auto;padding:0 12px}
-.card{background:rgba(17,24,39,.96);border:1px solid #223049;border-radius:12px;padding:14px;margin-bottom:12px}
-h2{margin:0 0 10px 0;font-size:20px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-label{font-size:13px;color:var(--muted)}
-input,select,button{background:#0a1324;color:var(--txt);border:1px solid #334155;border-radius:8px;padding:8px 10px}
-textarea{background:#0a1324;color:var(--txt);border:1px solid #334155;border-radius:8px;padding:8px 10px;font-family:Consolas,monospace}
-button{cursor:pointer}
-button.main{background:#0b5ed7;border-color:#0b5ed7}
-button.start{background:#15803d;border-color:#15803d}
-button.stop{background:#b91c1c;border-color:#b91c1c}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:8px}
-.kpi{border:1px solid #334155;border-radius:10px;padding:8px;background:#0b1220}
-.small{font-size:12px;color:var(--muted)}
-.val{font-size:20px;font-weight:700}
-.table{width:100%;border-collapse:collapse}
-.table th,.table td{border-bottom:1px solid #2d3748;padding:8px;text-align:left;font-size:14px}
-.code{font-family:Consolas,monospace}
-.plotPanel{border:1px solid #334155;border-radius:10px;padding:8px;background:#0b1220;margin-top:8px}
-.plotCanvas{width:100%;height:220px;display:block;border:1px solid #334155;border-radius:8px;background:linear-gradient(180deg,#0c1730,#091123)}
-.legendRow{display:flex;gap:12px;flex-wrap:wrap;margin:6px 2px 10px 2px}
-.legendItem{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
-.legendSwatch{width:12px;height:3px;border-radius:2px;display:inline-block}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <h2>Wheel Speed PID Tuner</h2>
-    <div class="small">Connect to Wi-Fi <span class="code">ESP32-PID-TUNE</span> (pass <span class="code">pid12345</span>) and open <span class="code">192.168.4.1</span>.</div>
-    <div class="small">Mode 0: single-wheel velocity tuning. Mode 1: full position + IMU heading control.</div>
-  </div>
-
-  <div class="card">
-    <div class="row">
-      <label>Mode</label>
-      <select id="mode">
-        <option value="0">0 - Single Wheel Velocity</option>
-        <option value="1">1 - Position + Heading</option>
-      </select>
-      <button class="main" onclick="setMode()">Set Mode</button>
-
-      <label>Wheel</label>
-      <select id="wheel">
-        <option value="0">MOTA BackRight (ENC4)</option>
-        <option value="1">MOTB FrontRight (ENC2)</option>
-        <option value="2">MOTD BackLeft (ENC1)</option>
-        <option value="3">MOTC FrontLeft (ENC3)</option>
-      </select>
-
-      <label>Target RPM</label><input id="target" type="number" value="50" step="1" min="0" max="60" />
-      <label>Kp</label><input id="kp" type="number" value="50" step="0.05" />
-      <label>Ki</label><input id="ki" type="number" value="6" step="0.05" />
-      <label>Kd</label><input id="kd" type="number" value="0.00" step="0.01" />
-      <label>MinPWM</label><input id="minpwm" type="number" value="160" step="1" max="255" />
-      <label>RPM LPF alpha</label><input id="alpha" type="number" value="0.02" step="0.01" min="0.02" max="1.00" />
-
-      <button class="main" onclick="applyConfig()">Apply Velocity Config</button>
-      <button class="start" onclick="startCtrl()">Start</button>
-      <button class="stop" onclick="stopCtrl()">Stop</button>
-      <button onclick="resetI()">Reset I</button>
-      <button onclick="resetEnc()">Reset Encoders</button>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>RPM Sign BR</label>
-      <select id="rs0" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
-      <label>FR</label>
-      <select id="rs1" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
-      <label>BL</label>
-      <select id="rs2" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
-      <label>FL</label>
-      <select id="rs3" onchange="applyRpmSign()"><option value="1">+1</option><option value="-1" selected>-1</option></select>
-      <button class="main" onclick="applyRpmSign()">Apply RPM Sign</button>
-    </div>
-    <div class="small" id="status">Status: -</div>
-  </div>
-
-  <div class="card">
-    <h2>Position + IMU Heading Control (4 Wheels)</h2>
-    <div class="row">
-      <label>Move Step (cm)</label><input id="pos_stepcm" type="number" value="30" step="1" onchange="applyMotionConfig()" />
-      <label>Wheel Diameter (cm)</label><input id="wheel_diam_cm" type="number" value="9.7" step="0.1" min="1" max="30" onchange="applyMotionConfig()" />
-      <label>Position Tol (cm)</label><input id="pos_tol" type="number" value="1.0" step="0.1" min="0.1" oninput="scheduleMotionConfigApply()" onchange="applyMotionConfig()" />
-      <label>Pos Kp</label><input id="pos_kp" type="number" value="0.05" step="0.005" onchange="applyMotionConfig()" />
-      <label>Pos Ki</label><input id="pos_ki" type="number" value="0.0018" step="0.0001" onchange="applyMotionConfig()" />
-      <label>Pos Kd</label><input id="pos_kd" type="number" value="0.0" step="0.001" onchange="applyMotionConfig()" />
-      <button class="start" onclick="startPosStep(1)">Move Forward Step</button>
-      <button class="start" onclick="startPosStep(-1)">Move Backward Step</button>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>Target Heading (deg)</label><input id="head_target" type="number" value="0" step="1" min="-180" max="180" onchange="applyMotionConfig()" />
-      <label>Head Kp</label><input id="head_kp" type="number" value="1.80" step="0.05" onchange="applyMotionConfig()" />
-      <label>Head Ki</label><input id="head_ki" type="number" value="0.01" step="0.01" onchange="applyMotionConfig()" />
-      <label>Head Kd</label><input id="head_kd" type="number" value="0.08" step="0.01" onchange="applyMotionConfig()" />
-      <label>Max Head Corr RPM</label><input id="head_max" type="number" value="20" step="1" min="0" max="60" onchange="applyMotionConfig()" />
-      <label>Hold At Stop</label>
-      <select id="head_hold" onchange="applyMotionConfig()"><option value="1">ON</option><option value="0">OFF</option></select>
-      <label>Hold Max Corr RPM</label><input id="head_hold_max" type="number" value="10" step="0.5" min="0" max="60" onchange="applyMotionConfig()" />
-      <label>Hold Deadband (deg)</label><input id="head_hold_db" type="number" value="2.0" step="0.1" min="0" max="30" onchange="applyMotionConfig()" />
-      <label>Hold Kp</label><input id="head_hold_kp" type="number" value="0.65" step="0.05" onchange="applyMotionConfig()" />
-      <label>Hold Ki</label><input id="head_hold_ki" type="number" value="0.08" step="0.01" onchange="applyMotionConfig()" />
-      <label>Hold Kd</label><input id="head_hold_kd" type="number" value="1.20" step="0.01" onchange="applyMotionConfig()" />
-      <label>In-Place Ki Scale</label><input id="head_yaw_ki_scale" type="number" value="0.50" step="0.05" min="0" max="1.5" onchange="applyMotionConfig()" />
-      <label>In-Place Ki Band (deg)</label><input id="head_yaw_ki_band" type="number" value="8.0" step="0.2" min="1" max="30" onchange="applyMotionConfig()" />
-      <button class="main" onclick="applyMotionConfig()">Apply Motion Config</button>
-      <button onclick="imuZero()">Zero Yaw</button>
-      <button onclick="imuCal()">Calibrate IMU Bias</button>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>Pos Cruise RPM</label><input id="pos_cruise" type="number" value="42" step="0.5" min="0" max="60" onchange="applyMotionConfig()" />
-      <label>Pos Slowdown Start (cm)</label><input id="pos_slowcm" type="number" value="10" step="0.5" min="1" max="200" onchange="applyMotionConfig()" />
-      <label>Pos Final Window (cm)</label><input id="pos_finalcm" type="number" value="1.0" step="0.2" min="0.5" max="60" onchange="applyMotionConfig()" />
-      <label>Pos Final Min RPM</label><input id="pos_minrpm" type="number" value="5.0" step="0.2" min="0" max="30" onchange="applyMotionConfig()" />
-      <label>Pos Cmd Slew (rpm/s)</label><input id="pos_slew" type="number" value="220" step="1" min="0" max="600" onchange="applyMotionConfig()" />
-      <label>Pos I-Band (cm)</label><input id="pos_iband" type="number" value="40" step="1" min="1" max="200" onchange="applyMotionConfig()" />
-      <label>No-Reverse Band (cm)</label><input id="pos_norev" type="number" value="0.8" step="0.1" min="0" max="20" onchange="applyMotionConfig()" />
-      <label>Done Max Wheel RPM</label><input id="pos_done_rpm" type="number" value="0.9" step="0.1" min="0.2" max="8" onchange="applyMotionConfig()" />
-      <label>Done Tol (cm)</label><input id="pos_done_tol" type="number" value="0.45" step="0.05" min="0.2" max="3" onchange="applyMotionConfig()" />
-      <label>Dist Overshoot (cm)</label><input id="pos_dovr" type="number" value="0.0" step="0.2" min="0" max="20" onchange="applyMotionConfig()" />
-      <label>Dist Scale (%)</label><input id="pos_dscale" type="number" value="2.0" step="0.1" min="0" max="10" onchange="applyMotionConfig()" />
-      <label>Dist Comp Max (cm)</label><input id="pos_dmax" type="number" value="6.0" step="0.2" min="0" max="30" onchange="applyMotionConfig()" />
-      <label>Move Yaw DB (deg)</label><input id="head_move_db" type="number" value="0.12" step="0.05" min="0" max="10" onchange="applyMotionConfig()" />
-      <label>Move Yaw Ki Band (deg)</label><input id="head_move_ki_band" type="number" value="4" step="0.2" min="0.2" max="30" onchange="applyMotionConfig()" />
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>Seq Distance (cm)</label><input id="pose_distcm" type="number" value="30" step="1" />
-      <label>Seq Heading (deg)</label><input id="pose_yaw" type="number" value="0" step="1" min="-180" max="180" />
-      <label>Turn Overshoot (deg)</label><input id="pose_tbias" type="number" value="4.5" step="0.2" min="0" max="20" />
-      <button class="start" onclick="startPoseMove()">TURN THEN MOVE</button>
-      <div class="small">Sequence behavior: rotate in place to target heading, then move forward while continuously holding that heading with IMU correction.</div>
-    </div>
-    <div class="small">Move deadband works only while translating; hold deadband works only when position is done and yaw is being held in place.</div>
-    <div class="row" style="margin-top:8px">
-      <button class="start" onclick="startYawHold()">START YAW HOLD (IN PLACE)</button>
-      <button class="stop" onclick="stopCtrl()">STOP YAW HOLD</button>
-      <div class="small">Use this row for yaw-only bench tests: set target heading then press START.</div>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>Serial Debug</label>
-      <select id="dbg_en"><option value="0">OFF</option><option value="1">ON</option></select>
-      <label>Period ms</label><input id="dbg_ms" type="number" value="120" step="10" min="50" max="2000" />
-      <button class="main" onclick="applyDebugConfig()">Apply Debug Config</button>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label>Web Recorder</label>
-      <button class="start" onclick="startWebRecorder()">Start Capture</button>
-      <button class="stop" onclick="stopWebRecorder()">Stop Capture</button>
-      <button onclick="clearWebRecorder()">Clear</button>
-      <button class="main" onclick="copyWebRecorder()">Copy CSV</button>
-    </div>
-    <div class="small" id="motionStatus">Motion: -</div>
-    <div class="small" id="imuStatus">IMU: -</div>
-    <div class="small" id="debugStatus">Debug: -</div>
-    <div class="small" id="rec_status">Recorder: idle</div>
-    <textarea id="rec_out" rows="8" style="width:100%;margin-top:8px" readonly></textarea>
-  </div>
-
-  <div class="card">
-    <h2>Slip/Stall Observer (IMU X/Y + Wheel RPM)</h2>
-    <div class="row">
-      <label>Enable</label>
-      <select id="slip_en"><option value="1">ON</option><option value="0">OFF</option></select>
-      <label>Wheel RPM Thresh</label><input id="slip_rpm" type="number" value="12" step="1" min="1" max="60" />
-      <label>Accel Thresh g</label><input id="slip_accg" type="number" value="0.03" step="0.005" min="0.001" max="1.5" />
-      <label>Detect ms</label><input id="slip_detect" type="number" value="300" step="20" min="80" max="3000" />
-      <label>Release ms</label><input id="slip_release" type="number" value="200" step="20" min="40" max="3000" />
-      <label>Slip Max RPM</label><input id="slip_maxrpm" type="number" value="25" step="1" min="0" max="60" />
-      <label>IMU Acc LPF</label><input id="slip_accalpha" type="number" value="0.20" step="0.01" min="0.02" max="1.00" />
-      <button class="main" onclick="applySlipConfig()">Apply Slip Config</button>
-    </div>
-    <div class="small" id="slipStatus">Slip: -</div>
-  </div>
-
-  <div class="card">
-    <h2>Raw Single-Wheel Test (Bypass PID)</h2>
-    <div class="row">
-      <label>Raw PWM</label><input id="rawpwm" type="number" value="255" step="1" min="0" max="255" />
-      <button class="start" onclick="startRaw(1)">Run +Raw</button>
-      <button class="start" onclick="startRaw(-1)">Run -Raw</button>
-      <button class="stop" onclick="stopRaw()">Stop Raw</button>
-    </div>
-    <div class="small" id="rawStatus">Raw mode: -</div>
-    <div class="small">Signed mapping is strict: +Raw drives IN1, -Raw drives IN2, both with duty 0..255.</div>
-  </div>
-
-  <div class="card">
-    <h2>4-Wheel MinPWM Auto Sweep (Ground Test)</h2>
-    <div class="row">
-      <label>Start PWM</label><input id="ms_start" type="number" value="20" step="1" />
-      <label>End PWM</label><input id="ms_end" type="number" value="90" step="1" />
-      <label>Step</label><input id="ms_step" type="number" value="2" step="1" />
-      <label>Hold ms</label><input id="ms_hold" type="number" value="700" step="50" />
-      <button class="start" onclick="startSweep(1)">Start FWD Sweep</button>
-      <button class="start" onclick="startSweep(-1)">Start REV Sweep</button>
-      <button class="stop" onclick="stopSweep()">Stop Sweep</button>
-    </div>
-    <div class="small" id="sweepStatus">Sweep: -</div>
-    <div class="small">Detected PWM is the first sweep value where average absolute RPM stays above threshold for multiple control ticks.</div>
-  </div>
-
-  <div class="card">
-    <h2>Live Wheel Data</h2>
-    <div class="grid">
-      <div class="kpi"><div class="small">BackRight RPM</div><div class="val" id="rpm0">0</div></div>
-      <div class="kpi"><div class="small">FrontRight RPM</div><div class="val" id="rpm1">0</div></div>
-      <div class="kpi"><div class="small">BackLeft RPM</div><div class="val" id="rpm2">0</div></div>
-      <div class="kpi"><div class="small">FrontLeft RPM</div><div class="val" id="rpm3">0</div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <table class="table">
-      <thead><tr><th>Wheel</th><th>Target RPM</th><th>Measured RPM</th><th>Error</th><th>PWM Cmd</th></tr></thead>
-      <tbody>
-        <tr><td>MOTA BackRight</td><td id="tr0">0</td><td id="mr0">0</td><td id="er0">0</td><td id="pw0">0</td></tr>
-        <tr><td>MOTB FrontRight</td><td id="tr1">0</td><td id="mr1">0</td><td id="er1">0</td><td id="pw1">0</td></tr>
-        <tr><td>MOTD BackLeft</td><td id="tr2">0</td><td id="mr2">0</td><td id="er2">0</td><td id="pw2">0</td></tr>
-        <tr><td>MOTC FrontLeft</td><td id="tr3">0</td><td id="mr3">0</td><td id="er3">0</td><td id="pw3">0</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>Live Tuning Graphs</h2>
-    <div class="small">Graphs track the active wheel selected in the control section and keep roughly the last 45-50 seconds.</div>
-
-    <div class="plotPanel">
-      <div class="small">Position Response (Mode 1)</div>
-      <div class="legendRow">
-        <span class="legendItem"><span class="legendSwatch" style="background:#22c55e"></span>Target Position (cm)</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#38bdf8"></span>Measured Position (cm)</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#ef4444"></span>Error (cm)</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#f59e0b"></span>Pos Cmd (rpm)</span>
-      </div>
-      <canvas id="plot_pos" class="plotCanvas"></canvas>
-    </div>
-
-    <div class="plotPanel">
-      <div class="small">Active Wheel RPM / Target / Error</div>
-      <div class="legendRow">
-        <span class="legendItem"><span class="legendSwatch" style="background:#38bdf8"></span>Target RPM</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#22c55e"></span>Measured RPM</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#ef4444"></span>Error</span>
-      </div>
-      <canvas id="plot_rpm" class="plotCanvas"></canvas>
-    </div>
-
-    <div class="plotPanel">
-      <div class="small">Active Wheel PWM Command</div>
-      <div class="legendRow">
-        <span class="legendItem"><span class="legendSwatch" style="background:#f97316"></span>PWM Cmd</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#a855f7"></span>Slip Marker</span>
-      </div>
-      <canvas id="plot_pwm" class="plotCanvas"></canvas>
-    </div>
-
-    <div class="plotPanel">
-      <div class="small">Heading Trace</div>
-      <div class="legendRow">
-        <span class="legendItem"><span class="legendSwatch" style="background:#10b981"></span>Yaw</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#f59e0b"></span>Heading Target</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#ef4444"></span>Heading Error</span>
-        <span class="legendItem"><span class="legendSwatch" style="background:#06b6d4"></span>Corr RPM (x10)</span>
-      </div>
-      <canvas id="plot_heading" class="plotCanvas"></canvas>
-    </div>
-  </div>
-</div>
-
-<script>
-function f(x,d=2){return Number(x).toFixed(d)}
-async function hit(url){const r=await fetch(url);if(!r.ok){alert('Request failed: '+url);return null;}return r.text();}
-function syncFieldValue(id,val){
-  const el=document.getElementById(id);
-  if(!el) return;
-  if(document.activeElement===el) return;
-  const next=String(val);
-  if(el.value!==next) el.value=next;
+bool extractArg(const String& line, const char* key, String& valueOut) {
+  String pattern = String(key) + "=";
+  int start = line.indexOf(pattern);
+  if (start < 0) {
+    return false;
+  }
+  start += pattern.length();
+  int end = line.indexOf(' ', start);
+  if (end < 0) {
+    end = line.length();
+  }
+  valueOut = line.substring(start, end);
+  return true;
 }
 
-const GRAPH_POINTS = 240;
-const WEB_REC_MAX_LINES = 700;
-let graphActiveWheel = -1;
-let webRecActive = false;
-let webRecLines = [];
-let webRecLastMs = -1;
-let motionCfgTimer = null;
-let motionCfgPending = false;
-let motionCfgFreezeUntilMs = 0;
-const graph = {
-  posTarget: [],
-  posMeasured: [],
-  posErr: [],
-  posCmd: [],
-  target: [],
-  measured: [],
-  err: [],
-  pwm: [],
-  slip: [],
-  yaw: [],
-  headingTarget: [],
-  headingErr: [],
-  headingCorr: [],
-};
-
-function pushGraph(key, v) {
-  const arr = graph[key];
-  const n = Number(v);
-  arr.push(Number.isFinite(n) ? n : 0);
-  if (arr.length > GRAPH_POINTS) arr.shift();
+float getFloatArg(const String& line, const char* key, float defaultValue) {
+  String value;
+  if (!extractArg(line, key, value)) {
+    return defaultValue;
+  }
+  return value.toFloat();
 }
 
-function clearWheelGraph() {
-  graph.target.length = 0;
-  graph.measured.length = 0;
-  graph.err.length = 0;
-  graph.pwm.length = 0;
-  graph.slip.length = 0;
+uint32_t getUIntArg(const String& line, const char* key, uint32_t defaultValue) {
+  String value;
+  if (!extractArg(line, key, value)) {
+    return defaultValue;
+  }
+  return (uint32_t)value.toInt();
 }
 
-function clearPositionGraph() {
-  graph.posTarget.length = 0;
-  graph.posMeasured.length = 0;
-  graph.posErr.length = 0;
-  graph.posCmd.length = 0;
+String firstToken(const String& line) {
+  int sp = line.indexOf(' ');
+  if (sp < 0) {
+    return line;
+  }
+  return line.substring(0, sp);
 }
 
-function scheduleMotionConfigApply() {
-  motionCfgFreezeUntilMs = Date.now() + 1200;
-  if (motionCfgTimer) clearTimeout(motionCfgTimer);
-  motionCfgTimer = setTimeout(() => {
-    applyMotionConfig();
-  }, 220);
-}
-
-function drawPlot(canvasId, series, yMin, yMax) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-
-  const rect = canvas.getBoundingClientRect();
-  const dpr = Math.max(window.devicePixelRatio || 1, 1);
-  const w = Math.max(240, Math.floor(rect.width * dpr));
-  const h = Math.max(120, Math.floor(rect.height * dpr));
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w;
-    canvas.height = h;
-  }
-
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, w, h);
-
-  ctx.fillStyle = '#091123';
-  ctx.fillRect(0, 0, w, h);
-
-  const padL = 50 * dpr;
-  const padR = 12 * dpr;
-  const padT = 10 * dpr;
-  const padB = 20 * dpr;
-  const pw = w - padL - padR;
-  const ph = h - padT - padB;
-
-  ctx.strokeStyle = '#1f2a44';
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const gy = padT + (ph * i / 4);
-    ctx.beginPath();
-    ctx.moveTo(padL, gy);
-    ctx.lineTo(w - padR, gy);
-    ctx.stroke();
-  }
-
-  ctx.font = `${11 * dpr}px Consolas, monospace`;
-  ctx.fillStyle = '#8aa0bf';
-  for (let i = 0; i <= 4; i++) {
-    const v = yMax - ((yMax - yMin) * i / 4);
-    const gy = padT + (ph * i / 4);
-    ctx.fillText(v.toFixed(0), 4 * dpr, gy + 4 * dpr);
-  }
-
-  const toX = (idx, count) => {
-    if (count <= 1) return padL;
-    return padL + (pw * idx / (count - 1));
-  };
-  const toY = (v) => {
-    const t = (v - yMin) / (yMax - yMin);
-    return padT + ph - (t * ph);
-  };
-
-  for (const s of series) {
-    const data = s.data || [];
-    if (data.length === 0) continue;
-    ctx.strokeStyle = s.color;
-    ctx.lineWidth = Math.max(1, Math.floor(1.6 * dpr));
-    ctx.beginPath();
-    for (let i = 0; i < data.length; i++) {
-      const x = toX(i, data.length);
-      const y = toY(Math.max(yMin, Math.min(yMax, data[i])));
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  }
-}
-
-function getAutoRange(seriesList, fallbackMin, fallbackMax) {
-  let vMin = Number.POSITIVE_INFINITY;
-  let vMax = Number.NEGATIVE_INFINITY;
-
-  for (const arr of seriesList) {
-    if (!arr || arr.length === 0) continue;
-    for (let i = 0; i < arr.length; i++) {
-      const v = Number(arr[i]);
-      if (!Number.isFinite(v)) continue;
-      if (v < vMin) vMin = v;
-      if (v > vMax) vMax = v;
-    }
-  }
-
-  if (!Number.isFinite(vMin) || !Number.isFinite(vMax)) {
-    return { min: fallbackMin, max: fallbackMax };
-  }
-
-  if (vMin === vMax) {
-    const pad = Math.max(1.0, Math.abs(vMin) * 0.2);
-    vMin -= pad;
-    vMax += pad;
-  }
-
-  const span = Math.max(0.5, vMax - vMin);
-  const pad = Math.max(0.5, span * 0.12);
-  vMin -= pad;
-  vMax += pad;
-
-  if (vMin > 0.0) vMin = 0.0;
-  if (vMax < 0.0) vMax = 0.0;
-
-  return { min: vMin, max: vMax };
-}
-
-function updateGraphs(d) {
-  const aw = Number(d.activeWheel) || 0;
-  if (graphActiveWheel !== aw) {
-    graphActiveWheel = aw;
-    clearWheelGraph();
-  }
-
-  const t = Number((d.target && d.target[aw]) || 0);
-  const m = Number((d.measured && d.measured[aw]) || 0);
-  const p = Number((d.pwm && d.pwm[aw]) || 0);
-  const e = t - m;
-  const posTargetCm = Number((d.position && d.position.targetCm) || 0);
-  const posCurrentCm = Number((d.position && d.position.currentCm) || 0);
-  const posErrCm = Number((d.position && d.position.errorCm) || 0);
-  const posCmdRpm = Number((d.position && d.position.cmdRpm) || 0);
-
-  pushGraph('posTarget', posTargetCm);
-  pushGraph('posMeasured', posCurrentCm);
-  pushGraph('posErr', posErrCm);
-  pushGraph('posCmd', posCmdRpm);
-
-  pushGraph('target', t);
-  pushGraph('measured', m);
-  pushGraph('err', e);
-  pushGraph('pwm', p);
-  pushGraph('slip', (d.slip && d.slip.detected) ? 240 : 0);
-  pushGraph('yaw', Number((d.imu && d.imu.yawDeg) || 0));
-  pushGraph('headingTarget', Number((d.heading && d.heading.targetDeg) || 0));
-  pushGraph('headingErr', Number((d.heading && d.heading.errorDeg) || 0));
-  pushGraph('headingCorr', Number((d.heading && d.heading.corrRpm) || 0) * 10);
-
-  const posRange = getAutoRange([graph.posTarget, graph.posMeasured, graph.posErr, graph.posCmd], -10, 10);
-  drawPlot('plot_pos', [
-    { data: graph.posTarget, color: '#22c55e' },
-    { data: graph.posMeasured, color: '#38bdf8' },
-    { data: graph.posErr, color: '#ef4444' },
-    { data: graph.posCmd, color: '#f59e0b' },
-  ], posRange.min, posRange.max);
-
-  drawPlot('plot_rpm', [
-    { data: graph.target, color: '#38bdf8' },
-    { data: graph.measured, color: '#22c55e' },
-    { data: graph.err, color: '#ef4444' },
-  ], -65, 65);
-
-  drawPlot('plot_pwm', [
-    { data: graph.pwm, color: '#f97316' },
-    { data: graph.slip, color: '#a855f7' },
-  ], -255, 255);
-
-  drawPlot('plot_heading', [
-    { data: graph.yaw, color: '#10b981' },
-    { data: graph.headingTarget, color: '#f59e0b' },
-    { data: graph.headingErr, color: '#ef4444' },
-    { data: graph.headingCorr, color: '#06b6d4' },
-  ], -180, 180);
-}
-
-function recorderHeader(){
-  return 'tMs,phase,errSettled,rateSettled,yawDeg,gyroDps,gyroFiltDps,rawErrDeg,usedErrDeg,corrTargetRpm,corrOutRpm,target0,meas0,pwm0,target1,meas1,pwm1,target2,meas2,pwm2,target3,meas3,pwm3';
-}
-
-function renderRecorder(){
-  const out=document.getElementById('rec_out');
-  const st=document.getElementById('rec_status');
-  if(st) st.textContent = `Recorder: ${webRecActive ? 'capturing' : 'idle'} | samples=${webRecLines.length}`;
-  if(out){
-    const txt = webRecLines.length ? (recorderHeader() + '\n' + webRecLines.join('\n')) : recorderHeader();
-    if(out.value!==txt) out.value=txt;
-  }
-}
-
-function appendRecorderSample(d){
-  if(!webRecActive || !d || !d.debug) return;
-  const ts = Number(d.nowMs || 0);
-  if(ts>0){
-    if(ts===webRecLastMs) return;
-    webRecLastMs = ts;
-  } else {
-    webRecLastMs += 1;
-  }
-
-  const line = [
-    ts,
-    Number(d.debug.yawPhase || 0),
-    d.debug.errSettled ? 1 : 0,
-    d.debug.rateSettled ? 1 : 0,
-    f((d.imu && d.imu.yawDeg) || 0, 3),
-    f((d.imu && d.imu.gyroDps) || 0, 3),
-    f(d.debug.gyroDpsFilt || 0, 3),
-    f(d.debug.rawHeadingErrDeg || 0, 3),
-    f(d.debug.usedHeadingErrDeg || 0, 3),
-    f(d.debug.corrTargetRpm || 0, 3),
-    f(d.debug.corrAfterSlewRpm || 0, 3),
-    f((d.target && d.target[0]) || 0, 2),
-    f((d.measured && d.measured[0]) || 0, 2),
-    Number((d.pwm && d.pwm[0]) || 0),
-    f((d.target && d.target[1]) || 0, 2),
-    f((d.measured && d.measured[1]) || 0, 2),
-    Number((d.pwm && d.pwm[1]) || 0),
-    f((d.target && d.target[2]) || 0, 2),
-    f((d.measured && d.measured[2]) || 0, 2),
-    Number((d.pwm && d.pwm[2]) || 0),
-    f((d.target && d.target[3]) || 0, 2),
-    f((d.measured && d.measured[3]) || 0, 2),
-    Number((d.pwm && d.pwm[3]) || 0)
-  ].join(',');
-
-  webRecLines.push(line);
-  if(webRecLines.length > WEB_REC_MAX_LINES) webRecLines.shift();
-  renderRecorder();
-}
-
-function startWebRecorder(){
-  webRecActive = true;
-  if(webRecLines.length===0) webRecLastMs = -1;
-  renderRecorder();
-}
-
-function stopWebRecorder(){
-  webRecActive = false;
-  renderRecorder();
-}
-
-function clearWebRecorder(){
-  webRecLines = [];
-  webRecLastMs = -1;
-  renderRecorder();
-}
-
-async function copyWebRecorder(){
-  const out=document.getElementById('rec_out');
-  if(!out) return;
-  try {
-    await navigator.clipboard.writeText(out.value || '');
-    const st=document.getElementById('rec_status');
-    if(st) st.textContent = `Recorder: ${webRecActive ? 'capturing' : 'idle'} | samples=${webRecLines.length} | copied`;
-  } catch(e) {
-    alert('Copy failed. You can still select text from the recorder and copy manually.');
-  }
-}
-
-async function applyConfig(){
-  const wheel=document.getElementById('wheel').value;
-  const target=document.getElementById('target').value;
-  const kp=document.getElementById('kp').value;
-  const ki=document.getElementById('ki').value;
-  const kd=document.getElementById('kd').value;
-  const minpwm=document.getElementById('minpwm').value;
-  const alpha=document.getElementById('alpha').value;
-  await hit(`/cmd/config?wheel=${wheel}&target=${target}&kp=${kp}&ki=${ki}&kd=${kd}&minpwm=${minpwm}&alpha=${alpha}`);
-  await refresh();
-}
-async function setMode(){
-  const m=document.getElementById('mode').value;
-  await hit(`/cmd/mode?m=${m}`);
-  await refresh();
-}
-async function applyMotionConfig(){
-  motionCfgPending = true;
-  motionCfgFreezeUntilMs = Date.now() + 1200;
-  const stepcm=document.getElementById('pos_stepcm').value;
-  const wdcm=document.getElementById('wheel_diam_cm').value;
-  const postol=document.getElementById('pos_tol').value;
-  const pkp=document.getElementById('pos_kp').value;
-  const pki=document.getElementById('pos_ki').value;
-  const pkd=document.getElementById('pos_kd').value;
-  const hyaw=document.getElementById('head_target').value;
-  const hkp=document.getElementById('head_kp').value;
-  const hki=document.getElementById('head_ki').value;
-  const hkd=document.getElementById('head_kd').value;
-  const hmax=document.getElementById('head_max').value;
-  const hhold=document.getElementById('head_hold').value;
-  const hholdmax=document.getElementById('head_hold_max').value;
-  const hholddb=document.getElementById('head_hold_db').value;
-  const hhkp=document.getElementById('head_hold_kp').value;
-  const hhki=document.getElementById('head_hold_ki').value;
-  const hhkd=document.getElementById('head_hold_kd').value;
-  const pcruise=document.getElementById('pos_cruise').value;
-  const pslow=document.getElementById('pos_slowcm').value;
-  const pfinal=document.getElementById('pos_finalcm').value;
-  const pmin=document.getElementById('pos_minrpm').value;
-  const pslew=document.getElementById('pos_slew').value;
-  const piband=document.getElementById('pos_iband').value;
-  const pnorev=document.getElementById('pos_norev').value;
-  const pdonerpm=document.getElementById('pos_done_rpm').value;
-  const pdonetol=document.getElementById('pos_done_tol').value;
-  const dovr=document.getElementById('pos_dovr').value;
-  const pdscale=document.getElementById('pos_dscale').value;
-  const pdmax=document.getElementById('pos_dmax').value;
-  const hmdb=document.getElementById('head_move_db').value;
-  const hmkiband=document.getElementById('head_move_ki_band').value;
-  const yikiscale=document.getElementById('head_yaw_ki_scale').value;
-  const yikiband=document.getElementById('head_yaw_ki_band').value;
-  const tbias=document.getElementById('pose_tbias').value;
-  const alpha=document.getElementById('alpha').value;
-  try {
-    await hit(`/cmd/motionConfig?stepcm=${stepcm}&wdcm=${wdcm}&postol=${postol}&pkp=${pkp}&pki=${pki}&pkd=${pkd}&pcruise=${pcruise}&pslow=${pslow}&pfinal=${pfinal}&pmin=${pmin}&pslew=${pslew}&piband=${piband}&pnorev=${pnorev}&pdonerpm=${pdonerpm}&pdonetol=${pdonetol}&dovr=${dovr}&pdscale=${pdscale}&pdmax=${pdmax}&hyaw=${hyaw}&hkp=${hkp}&hki=${hki}&hkd=${hkd}&hmdb=${hmdb}&hmkiband=${hmkiband}&hmax=${hmax}&hhold=${hhold}&hholdmax=${hholdmax}&hholddb=${hholddb}&hhkp=${hhkp}&hhki=${hhki}&hhkd=${hhkd}&yikiscale=${yikiscale}&yikiband=${yikiband}&tbias=${tbias}&alpha=${alpha}`);
-    await refresh();
-  } finally {
-    motionCfgPending = false;
-    motionCfgFreezeUntilMs = Date.now() + 500;
-  }
-}
-async function startYawHold(){
-  const hyaw=document.getElementById('head_target').value;
-  const tbias=document.getElementById('pose_tbias').value;
-  await applyMotionConfig();
-  await hit(`/cmd/yawHoldStart?hyaw=${hyaw}&tbias=${tbias}`);
-  await refresh();
-}
-async function startPosStep(dir){
-  const stepcm=document.getElementById('pos_stepcm').value;
-  const wdcm=document.getElementById('wheel_diam_cm').value;
-  await applyMotionConfig();
-  clearPositionGraph();
-  await hit(`/cmd/posStep?dir=${dir}&stepcm=${stepcm}&wdcm=${wdcm}`);
-  await refresh();
-}
-async function startPoseMove(){
-  const distcm=document.getElementById('pose_distcm').value;
-  const hyaw=document.getElementById('pose_yaw').value;
-  const tbias=document.getElementById('pose_tbias').value;
-  const wdcm=document.getElementById('wheel_diam_cm').value;
-  await applyMotionConfig();
-  clearPositionGraph();
-  await hit(`/cmd/poseMove?distcm=${distcm}&hyaw=${hyaw}&wdcm=${wdcm}&tbias=${tbias}`);
-  await refresh();
-}
-async function applyRpmSign(){
-  const m0=document.getElementById('rs0').value;
-  const m1=document.getElementById('rs1').value;
-  const m2=document.getElementById('rs2').value;
-  const m3=document.getElementById('rs3').value;
-  await hit(`/cmd/rpmSign?m0=${m0}&m1=${m1}&m2=${m2}&m3=${m3}`);
-  await refresh();
-}
-async function applySlipConfig(){
-  const en=document.getElementById('slip_en').value;
-  const rpm=document.getElementById('slip_rpm').value;
-  const accg=document.getElementById('slip_accg').value;
-  const detect=document.getElementById('slip_detect').value;
-  const release=document.getElementById('slip_release').value;
-  const maxrpm=document.getElementById('slip_maxrpm').value;
-  const accalpha=document.getElementById('slip_accalpha').value;
-  await hit(`/cmd/slipConfig?en=${en}&rpm=${rpm}&accg=${accg}&detect=${detect}&release=${release}&maxrpm=${maxrpm}&accalpha=${accalpha}`);
-  await refresh();
-}
-async function applyDebugConfig(){
-  const en=document.getElementById('dbg_en').value;
-  const ms=document.getElementById('dbg_ms').value;
-  await hit(`/cmd/debugConfig?en=${en}&ms=${ms}`);
-  await refresh();
-}
-async function startCtrl(){await hit('/cmd/start'); await refresh();}
-async function stopCtrl(){await hit('/cmd/stop'); await refresh();}
-async function resetI(){await hit('/cmd/resetI'); await refresh();}
-async function resetEnc(){await hit('/cmd/resetEnc'); await refresh();}
-async function imuZero(){await hit('/cmd/imuZero'); await refresh();}
-async function imuCal(){await hit('/cmd/imuCal'); await refresh();}
-async function startRaw(dir){
-  const pwm=document.getElementById('rawpwm').value;
-  const signed = Number(pwm) * Number(dir);
-  await hit(`/cmd/rawStart?pwm=${signed}`);
-  await refresh();
-}
-async function stopRaw(){await hit('/cmd/rawStop'); await refresh();}
-async function startSweep(dir){
-  const s=document.getElementById('ms_start').value;
-  const e=document.getElementById('ms_end').value;
-  const st=document.getElementById('ms_step').value;
-  const h=document.getElementById('ms_hold').value;
-  await hit(`/cmd/minpwmStart?dir=${dir}&start=${s}&end=${e}&step=${st}&hold=${h}`);
-  await refresh();
-}
-async function stopSweep(){await hit('/cmd/minpwmStop'); await refresh();}
-
-async function refresh(){
-  const r=await fetch('/data');
-  if(!r.ok) return;
-  const d=await r.json();
-  const freezeMotionSync = motionCfgPending || (Date.now() < motionCfgFreezeUntilMs);
-
-  document.getElementById('status').textContent = `Status: ${d.enabled ? 'RUNNING' : 'STOPPED'} | Mode=${d.modeName} | Active wheel=${d.activeWheel} | Target=${f(d.pidTarget,1)} rpm (0..60) | Kp=${f(d.kp,2)} Ki=${f(d.ki,2)} Kd=${f(d.kd,2)} MinPWM=${d.minPwm} | LPF alpha=${f(d.rpmFilterAlpha,2)} | Sign BR/FR/BL/FL=${d.rpmSign[0]}/${d.rpmSign[1]}/${d.rpmSign[2]}/${d.rpmSign[3]}`;
-  document.getElementById('rawStatus').textContent = `Raw mode: ${d.raw.enabled ? 'ACTIVE' : 'IDLE'} | PWM=${d.raw.pwm}`;
-  const seqAgeMs = d.position.poseMovePhaseStartMs > 0 ? (d.nowMs - d.position.poseMovePhaseStartMs) : 0;
-  document.getElementById('motionStatus').textContent = `Position: target=${f(d.position.targetCm,2)} cm (${f(d.position.targetCounts,0)} cnt) | current=${f(d.position.currentCm,2)} cm (${f(d.position.currentCounts,0)} cnt) | error=${f(d.position.errorCm,2)} cm (${f(d.position.errorCounts,0)} cnt) | tol=${f(d.position.tolCm,2)} cm | cmd=${f(d.position.cmdRpm,2)} rpm | done=${d.position.done ? 'YES' : 'NO'} | Seq active=${d.position.poseMoveActive ? 1 : 0} phase=${f(d.position.poseMovePhase,0)} dist=${f(d.position.poseMoveDistanceCm,2)}cm age=${f(seqAgeMs,0)}ms tmo=${f(d.position.poseMoveTurnTimeoutMs,0)}ms res=${f(d.position.poseMoveLastResult,0)} | encHealthy=${(d.encoderHealthy||[]).map(v=>v?1:0).join('/') || '-'} | reqYaw=${f(d.position.poseMoveRequestedYawDeg,2)} tgtYaw=${f(d.heading.targetDeg,2)} bias=${f(d.position.poseMoveAppliedBiasDeg,2)} (cfg ${f(d.heading.turnOvershootDeg,2)}) | MoveHeadPID=(${f(d.heading.kp,2)}, ${f(d.heading.ki,2)}, ${f(d.heading.kd,2)}) | HoldHeadPID=(${f(d.heading.holdKp,2)}, ${f(d.heading.holdKi,2)}, ${f(d.heading.holdKd,2)}) | Hold=${d.heading.holdAtStop ? 'ON' : 'OFF'} active=${d.heading.holdActive ? '1' : '0'} stable=${f(d.heading.holdStableMs,0)}ms | hold min/max=${f(d.heading.holdMinRpm,1)}/${f(d.heading.holdMaxRpm,1)} db=${f(d.heading.holdDeadbandDeg,1)}deg`;
-  document.getElementById('imuStatus').textContent = `IMU: ${d.imu.ok ? 'OK' : 'NOT FOUND'} | yaw=${f(d.imu.yawDeg,2)} deg | gyroZ=${f(d.imu.gyroDps,2)} dps | accX=${f(d.imu.accXg,3)}g | accY=${f(d.imu.accYg,3)}g | accXY=${f(d.imu.accXYg,3)}g | bias=${f(d.imu.biasDps,3)} dps | headingErr=${f(d.heading.errorDeg,2)} deg | corr=${f(d.heading.corrRpm,2)} rpm`;
-  document.getElementById('debugStatus').textContent = `Debug: serial=${d.debug.serialEnabled ? 'ON' : 'OFF'}@${f(d.debug.serialPeriodMs,0)}ms | phase=${f(d.debug.yawPhase,0)} lock=${d.heading.yawHoldInPlaceMode ? 1 : 0} | rawErr=${f(d.debug.rawHeadingErrDeg,2)} usedErr=${f(d.debug.usedHeadingErrDeg,2)} | corrTarget=${f(d.debug.corrTargetRpm,2)} corrOut=${f(d.debug.corrAfterSlewRpm,2)} | gyroFilt=${f(d.debug.gyroDpsFilt,2)} | settled E/R=${d.debug.errSettled ? 1 : 0}/${d.debug.rateSettled ? 1 : 0}`;
-  document.getElementById('slipStatus').textContent = `Slip: ${d.slip.enabled ? 'ENABLED' : 'DISABLED'} | state=${d.slip.detected ? 'DETECTED' : 'clear'} | candidate=${f(d.slip.candidateMs,0)}ms | avgWheel=${f(d.slip.avgWheelRpm,2)} rpm | rpmThr=${f(d.slip.wheelRpmThresh,1)} | accThr=${f(d.slip.accelThreshG,3)}g | detect=${f(d.slip.detectMs,0)}ms | release=${f(d.slip.releaseMs,0)}ms | maxRPM=${f(d.slip.maxRpm,1)}`;
-
-  const sm=d.minSweep;
-  document.getElementById('sweepStatus').textContent = `Sweep: ${sm.active ? 'ACTIVE' : 'IDLE'} | Dir=${sm.direction > 0 ? 'FWD' : 'REV'} | PWM=${sm.currentPwm} | Range=${sm.startPwm}-${sm.endPwm} step ${sm.stepPwm} | Hold=${sm.holdMs}ms | AvgAbsRPM=${f(sm.avgAbsRpm,2)} | Detected=${sm.detectedPwm}`;
-
-  syncFieldValue('mode', d.mode);
-  syncFieldValue('rs0', d.rpmSign[0]);
-  syncFieldValue('rs1', d.rpmSign[1]);
-  syncFieldValue('rs2', d.rpmSign[2]);
-  syncFieldValue('rs3', d.rpmSign[3]);
-  syncFieldValue('slip_en', d.slip.enabled ? '1' : '0');
-  syncFieldValue('slip_rpm', f(d.slip.wheelRpmThresh,1));
-  syncFieldValue('slip_accg', f(d.slip.accelThreshG,3));
-  syncFieldValue('slip_detect', f(d.slip.detectMs,0));
-  syncFieldValue('slip_release', f(d.slip.releaseMs,0));
-  syncFieldValue('slip_maxrpm', f(d.slip.maxRpm,1));
-  syncFieldValue('slip_accalpha', f(d.imu.accAlpha,2));
-  if (!freezeMotionSync) syncFieldValue('pos_stepcm', f(d.position.stepCm,2));
-  if (!freezeMotionSync) syncFieldValue('wheel_diam_cm', f(d.position.wheelDiameterCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_tol', f(d.position.tolCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_cruise', f(d.position.cruiseRpm,1));
-  if (!freezeMotionSync) syncFieldValue('pos_slowcm', f(d.position.slowdownStartCm,1));
-  if (!freezeMotionSync) syncFieldValue('pos_finalcm', f(d.position.finalWindowCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_minrpm', f(d.position.finalMinRpm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_slew', f(d.position.cmdSlewRpmPerSec,1));
-  if (!freezeMotionSync) syncFieldValue('pos_iband', f(d.position.integralBandCm,1));
-  if (!freezeMotionSync) syncFieldValue('pos_norev', f(d.position.noReverseBandCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_done_rpm', f(d.position.doneMaxWheelRpm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_done_tol', f(d.position.doneTolCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_dovr', f(d.position.distOvershootCm,2));
-  if (!freezeMotionSync) syncFieldValue('pos_dscale', f(d.position.distScaleCompPct,2));
-  if (!freezeMotionSync) syncFieldValue('pos_dmax', f(d.position.distCompMaxCm,2));
-  syncFieldValue('head_target', f(d.heading.targetDeg,1));
-  if (!freezeMotionSync) syncFieldValue('head_kp', f(d.heading.kp,2));
-  if (!freezeMotionSync) syncFieldValue('head_ki', f(d.heading.ki,3));
-  if (!freezeMotionSync) syncFieldValue('head_kd', f(d.heading.kd,3));
-  if (!freezeMotionSync) syncFieldValue('head_move_db', f(d.heading.moveDeadbandDeg,2));
-  if (!freezeMotionSync) syncFieldValue('head_move_ki_band', f(d.heading.moveKiErrBandDeg,2));
-  if (!freezeMotionSync) syncFieldValue('head_max', f(d.heading.maxCorrRpm,1));
-  if (!freezeMotionSync) syncFieldValue('head_base', f(d.heading.enableBaseRpm,2));
-  syncFieldValue('head_sign', String(d.heading.sign));
-  if (!freezeMotionSync) syncFieldValue('head_hold', d.heading.holdAtStop ? '1' : '0');
-  if (!freezeMotionSync) syncFieldValue('head_hold_max', f(d.heading.holdMaxRpm,1));
-  if (!freezeMotionSync) syncFieldValue('head_hold_minpwm', f(d.heading.holdMinPwm,0));
-  if (!freezeMotionSync) syncFieldValue('head_db', f(d.heading.deadbandDeg,1));
-  if (!freezeMotionSync) syncFieldValue('head_hold_db', f(d.heading.holdDeadbandDeg,1));
-  if (!freezeMotionSync) syncFieldValue('head_hold_kp', f(d.heading.holdKp,2));
-  if (!freezeMotionSync) syncFieldValue('head_hold_ki', f(d.heading.holdKi,2));
-  if (!freezeMotionSync) syncFieldValue('head_hold_kd', f(d.heading.holdKd,2));
-  if (!freezeMotionSync) syncFieldValue('head_yaw_ki_scale', f(d.heading.yawHoldInPlaceKiScale,2));
-  if (!freezeMotionSync) syncFieldValue('head_yaw_ki_band', f(d.heading.yawHoldInPlaceKiErrDeg,1));
-  if (!freezeMotionSync) syncFieldValue('head_hold_rate_db', f(d.heading.holdExitRateDps,2));
-  if (!freezeMotionSync) syncFieldValue('head_slew', f(d.heading.corrSlewRpmPerSec,1));
-  if (!freezeMotionSync) syncFieldValue('pose_tbias', f(d.heading.turnOvershootDeg,2));
-  if (!freezeMotionSync && d.position.poseMoveActive) syncFieldValue('pose_yaw', f(d.position.poseMoveRequestedYawDeg,1));
-  if (!freezeMotionSync && d.position.poseMoveActive) syncFieldValue('pose_distcm', f(d.position.poseMoveDistanceCm,2));
-  syncFieldValue('dbg_en', d.debug.serialEnabled ? '1' : '0');
-  syncFieldValue('dbg_ms', f(d.debug.serialPeriodMs,0));
-
-  for(let i=0;i<4;i++){
-    document.getElementById('rpm'+i).textContent=f(d.measured[i],1);
-    document.getElementById('tr'+i).textContent=f(d.target[i],1);
-    document.getElementById('mr'+i).textContent=f(d.measured[i],1);
-    document.getElementById('er'+i).textContent=f(d.target[i]-d.measured[i],1);
-    document.getElementById('pw'+i).textContent=d.pwm[i];
-  }
-
-  appendRecorderSample(d);
-  updateGraphs(d);
-}
-setInterval(refresh, 200);
-renderRecorder();
-refresh();
-</script>
-</body>
-</html>
-)HTML";
-}
-
-String jsonData() {
-  String s = "{";
-  s += "\"nowMs\":" + String(millis()) + ",";
-  s += "\"enabled\":" + String(controllerEnabled ? "true" : "false") + ",";
-  s += "\"mode\":" + String((int)controlMode) + ",";
-  s += "\"modeName\":\"" + String(controlMode == MODE_POSITION_HEADING ? "position+heading" : "single-wheel velocity") + "\",";
-  s += "\"activeWheel\":" + String(activeWheel) + ",";
-  s += "\"pidTarget\":" + String(pidTargetRpm, 3) + ",";
-  s += "\"kp\":" + String(pid[activeWheel].kp, 4) + ",";
-  s += "\"ki\":" + String(pid[activeWheel].ki, 4) + ",";
-  s += "\"kd\":" + String(pid[activeWheel].kd, 4) + ",";
-  s += "\"minPwm\":" + String(minPwm) + ",";
-  s += "\"rpmFilterAlpha\":" + String(rpmFilterAlpha, 3) + ",";
-
-  s += "\"rpmSign\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(rpmSign[i]);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"raw\":{";
-  s += "\"enabled\":" + String(rawModeEnabled ? "true" : "false") + ",";
-  s += "\"pwm\":" + String(rawPwmCmd);
-  s += "},";
-
-  s += "\"minSweep\":{";
-  s += "\"active\":" + String(minSweep.active ? "true" : "false") + ",";
-  s += "\"direction\":" + String(minSweep.direction) + ",";
-  s += "\"startPwm\":" + String(minSweep.startPwm) + ",";
-  s += "\"endPwm\":" + String(minSweep.endPwm) + ",";
-  s += "\"stepPwm\":" + String(minSweep.stepPwm) + ",";
-  s += "\"holdMs\":" + String(minSweep.holdMs) + ",";
-  s += "\"currentPwm\":" + String(minSweep.currentPwm) + ",";
-  s += "\"detectedPwm\":" + String(minSweep.detectedPwm) + ",";
-  s += "\"avgAbsRpm\":" + String(minSweep.avgAbsRpm, 3);
-  s += "},";
-
-  s += "\"imu\":{";
-  s += "\"ok\":" + String(imuOk ? "true" : "false") + ",";
-  s += "\"yawDeg\":" + String(imuYawDeg, 3) + ",";
-  s += "\"gyroDps\":" + String(imuGyroDps, 3) + ",";
-  s += "\"accXg\":" + String(imuAccXg, 4) + ",";
-  s += "\"accYg\":" + String(imuAccYg, 4) + ",";
-  s += "\"accXYg\":" + String(imuAccXYg, 4) + ",";
-  s += "\"accAlpha\":" + String(imuAccAlpha, 3) + ",";
-  s += "\"biasDps\":" + String(imuBiasDps, 4);
-  s += "},";
-
-  s += "\"slip\":{";
-  s += "\"enabled\":" + String(slipEnabled ? "true" : "false") + ",";
-  s += "\"detected\":" + String(slipDetected ? "true" : "false") + ",";
-  s += "\"candidateMs\":" + String(slipCandidateMs, 1) + ",";
-  s += "\"wheelRpmThresh\":" + String(slipWheelRpmThresh, 3) + ",";
-  s += "\"accelThreshG\":" + String(slipAccelThreshG, 4) + ",";
-  s += "\"detectMs\":" + String(slipDetectMs, 1) + ",";
-  s += "\"releaseMs\":" + String(slipReleaseMs, 1) + ",";
-  s += "\"maxRpm\":" + String(slipMaxRpm, 3) + ",";
-  s += "\"avgWheelRpm\":" + String(slipAvgWheelRpm, 3);
-  s += "},";
-
-  s += "\"position\":{";
-  s += "\"targetCounts\":" + String(positionTargetCounts, 3) + ",";
-  s += "\"currentCounts\":" + String(positionCurrentCounts, 3) + ",";
-  s += "\"errorCounts\":" + String(positionErrorCounts, 3) + ",";
-  s += "\"targetCm\":" + String(countsToCm(positionTargetCounts), 3) + ",";
-  s += "\"currentCm\":" + String(countsToCm(positionCurrentCounts), 3) + ",";
-  s += "\"errorCm\":" + String(countsToCm(positionErrorCounts), 3) + ",";
-  s += "\"stepCm\":" + String(positionStepCm, 3) + ",";
-  s += "\"wheelDiameterCm\":" + String(wheelDiameterCm, 3) + ",";
-  s += "\"poseMoveActive\":" + String(poseMoveActive ? "true" : "false") + ",";
-  s += "\"poseMovePhase\":" + String(poseMovePhase) + ",";
-  s += "\"poseMoveDistanceCm\":" + String(poseMoveDistanceCm, 3) + ",";
-  s += "\"poseMoveStartCounts\":" + String(poseMoveStartCounts, 3) + ",";
-  s += "\"poseMoveTargetCounts\":" + String(poseMoveTargetCounts, 3) + ",";
-  s += "\"poseMovePhaseStartMs\":" + String(poseMovePhaseStartMs) + ",";
-  s += "\"poseMoveTurnTimeoutMs\":" + String(poseMoveTurnTimeoutMs) + ",";
-  s += "\"poseMoveLastResult\":" + String(poseMoveLastResult) + ",";
-  s += "\"poseMoveRequestedYawDeg\":" + String(poseMoveRequestedYawDeg, 3) + ",";
-  s += "\"poseMoveAppliedBiasDeg\":" + String(poseMoveAppliedBiasDeg, 3) + ",";
-  s += "\"poseMoveAppliedDistBiasCm\":" + String(poseMoveAppliedDistBiasCm, 3) + ",";
-  s += "\"tolCounts\":" + String(cmToCounts(positionTolCm), 3) + ",";
-  s += "\"tolCm\":" + String(positionTolCm, 3) + ",";
-  s += "\"cruiseRpm\":" + String(posCruiseRpm, 3) + ",";
-  s += "\"slowdownStartCm\":" + String(posSlowdownStartCm, 3) + ",";
-  s += "\"finalWindowCm\":" + String(posFinalWindowCm, 3) + ",";
-  s += "\"finalMinRpm\":" + String(posFinalMinRpm, 3) + ",";
-  s += "\"cmdSlewRpmPerSec\":" + String(posCmdSlewRpmPerSec, 3) + ",";
-  s += "\"integralBandCm\":" + String(posIntegralBandCm, 3) + ",";
-  s += "\"noReverseBandCm\":" + String(posNoReverseBandCm, 3) + ",";
-  s += "\"doneMaxWheelRpm\":" + String(posDoneMaxWheelRpm, 3) + ",";
-  s += "\"doneTolCm\":" + String(posDoneTolCm, 3) + ",";
-  s += "\"distOvershootCm\":" + String(distOvershootCm, 3) + ",";
-  s += "\"distScaleCompPct\":" + String(distScaleCompPct, 3) + ",";
-  s += "\"distCompMaxCm\":" + String(distCompMaxCm, 3) + ",";
-  s += "\"distLongMoveExtraCm\":" + String(distLongMoveExtraCm, 3) + ",";
-  s += "\"distLongMoveStartCm\":" + String(distLongMoveStartCm, 3) + ",";
-  s += "\"cmdRpm\":" + String(positionCmdRpm, 3) + ",";
-  s += "\"done\":" + String(positionDone ? "true" : "false") + ",";
-  s += "\"kp\":" + String(posPid.kp, 5) + ",";
-  s += "\"ki\":" + String(posPid.ki, 5) + ",";
-  s += "\"kd\":" + String(posPid.kd, 5);
-  s += "},";
-
-  s += "\"heading\":{";
-  s += "\"targetDeg\":" + String(headingTargetDeg, 3) + ",";
-  s += "\"errorDeg\":" + String(headingErrorDeg, 3) + ",";
-  s += "\"corrRpm\":" + String(headingCorrRpm, 3) + ",";
-  s += "\"maxCorrRpm\":" + String(headingCorrMaxRpm, 3) + ",";
-  s += "\"holdMaxRpm\":" + String(headingHoldMaxRpm, 3) + ",";
-  s += "\"holdMinRpm\":" + String(headingHoldMinRpm, 3) + ",";
-  s += "\"holdMinPwm\":" + String(holdMinPwm) + ",";
-  s += "\"holdEnterDeg\":" + String(headingHoldEnterDeg, 3) + ",";
-  s += "\"holdExitDeg\":" + String(headingHoldExitDeg, 3) + ",";
-  s += "\"holdExitRateDps\":" + String(headingHoldExitRateDps, 3) + ",";
-  s += "\"holdActive\":" + String(headingHoldActive ? "true" : "false") + ",";
-  s += "\"holdStableMs\":" + String(headingHoldStableMs, 1) + ",";
-  s += "\"corrSlewRpmPerSec\":" + String(headingCorrSlewRpmPerSec, 3) + ",";
-  s += "\"deadbandDeg\":" + String(headingDeadbandDeg, 3) + ",";
-  s += "\"moveDeadbandDeg\":" + String(headingMoveDeadbandDeg, 3) + ",";
-  s += "\"moveKiErrBandDeg\":" + String(headingMoveKiErrBandDeg, 3) + ",";
-  s += "\"holdDeadbandDeg\":" + String(headingHoldDeadbandDeg, 3) + ",";
-  s += "\"enableBaseRpm\":" + String(headingEnableBaseRpm, 3) + ",";
-  s += "\"sign\":" + String(headingCorrSign) + ",";
-  s += "\"yawHoldInPlaceMode\":" + String(yawHoldInPlaceMode ? "true" : "false") + ",";
-  s += "\"autoLock\":" + String(autoLockHeadingOnStep ? "true" : "false") + ",";
-  s += "\"holdAtStop\":" + String(holdHeadingAtStop ? "true" : "false") + ",";
-  s += "\"kp\":" + String(headingPid.kp, 5) + ",";
-  s += "\"ki\":" + String(headingPid.ki, 5) + ",";
-  s += "\"kd\":" + String(headingPid.kd, 5) + ",";
-  s += "\"holdKp\":" + String(headingHoldPid.kp, 5) + ",";
-  s += "\"holdKi\":" + String(headingHoldPid.ki, 5) + ",";
-  s += "\"holdKd\":" + String(headingHoldPid.kd, 5) + ",";
-  s += "\"yawHoldInPlaceKiScale\":" + String(yawHoldInPlaceKiScale, 5) + ",";
-  s += "\"yawHoldInPlaceKiErrDeg\":" + String(yawHoldInPlaceKiErrDeg, 5) + ",";
-  s += "\"turnOvershootDeg\":" + String(turnOvershootDeg, 5);
-  s += "},";
-
-  s += "\"debug\":{";
-  s += "\"serialEnabled\":" + String(debugSerialEnabled ? "true" : "false") + ",";
-  s += "\"serialPeriodMs\":" + String(debugSerialPeriodMs) + ",";
-  s += "\"yawPhase\":" + String(debugYawPhase) + ",";
-  s += "\"errSettled\":" + String(debugErrSettled ? "true" : "false") + ",";
-  s += "\"rateSettled\":" + String(debugRateSettled ? "true" : "false") + ",";
-  s += "\"rawHeadingErrDeg\":" + String(debugRawHeadingErrDeg, 3) + ",";
-  s += "\"usedHeadingErrDeg\":" + String(debugUsedHeadingErrDeg, 3) + ",";
-  s += "\"corrTargetRpm\":" + String(debugCorrTargetRpm, 3) + ",";
-  s += "\"corrAfterSlewRpm\":" + String(debugCorrAfterSlewRpm, 3) + ",";
-  s += "\"gyroDpsFilt\":" + String(imuGyroDpsFilt, 3) + ",";
-
-  s += "\"wheelErr\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(debugWheelErr[i], 3);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"wheelPidOut\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(debugWheelPidOut[i], 3);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"wheelCmdPreBreakaway\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(debugWheelCmdPreBreakaway[i]);
-    if (i < 3) s += ",";
-  }
-  s += "]";
-  s += "},";
-
-  s += "\"target\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(targetRpm[i], 3);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  // measuredRpm[] is already in logical wheel order [MOTA BR, MOTB FR, MOTD BL, MOTC FL]
-  s += "\"measured\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(measuredRpm[i], 3);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"measuredRaw\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(measuredRpmRaw[i], 3);
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"encoderHealthy\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(encoderHealthy[i] ? "true" : "false");
-    if (i < 3) s += ",";
-  }
-  s += "],";
-
-  s += "\"pwm\":[";
-  for (uint8_t i = 0; i < 4; i++) {
-    s += String(pwmCmd[i]);
-    if (i < 3) s += ",";
-  }
-  s += "]";
-
-  s += "}";
-  return s;
-}
-
-void handleRoot() {
-  server.send(200, "text/html", pageHtml());
-}
-
-void handleData() {
-  STATE_LOCK();
-  String body = jsonData();
-  STATE_UNLOCK();
-  server.send(200, "application/json", body);
-}
-
-void handleDebugConfig() {
-  STATE_LOCK();
-  if (server.hasArg("en")) {
-    debugSerialEnabled = server.arg("en").toInt() != 0;
-  }
-  if (server.hasArg("ms")) {
-    debugSerialPeriodMs = (uint16_t)constrain(server.arg("ms").toInt(), 50, 2000);
-  }
-
-  String msg = "Debug config applied | serial=" + String(debugSerialEnabled ? "ON" : "OFF") +
-               " | periodMs=" + String(debugSerialPeriodMs);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", msg);
-}
-
-void handleRpmSign() {
-  STATE_LOCK();
-  for (uint8_t i = 0; i < 4; i++) {
-    String argName = String("m") + String(i);
-    if (server.hasArg(argName)) {
-      int s = server.arg(argName).toInt();
-      rpmSign[i] = (s >= 0) ? 1 : -1;
-    }
-  }
-
-  resetAllPidStates();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "RPM sign updated");
-}
-
-void handleSlipConfig() {
-  STATE_LOCK();
-  if (server.hasArg("en")) {
-    slipEnabled = server.arg("en").toInt() != 0;
-  }
-  if (server.hasArg("rpm")) {
-    slipWheelRpmThresh = constrain(server.arg("rpm").toFloat(), 1.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("accg")) {
-    slipAccelThreshG = constrain(server.arg("accg").toFloat(), 0.001f, 1.5f);
-  }
-  if (server.hasArg("detect")) {
-    slipDetectMs = constrain(server.arg("detect").toFloat(), 80.0f, 3000.0f);
-  }
-  if (server.hasArg("release")) {
-    slipReleaseMs = constrain(server.arg("release").toFloat(), 40.0f, 3000.0f);
-  }
-  if (server.hasArg("maxrpm")) {
-    slipMaxRpm = constrain(server.arg("maxrpm").toFloat(), 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("accalpha")) {
-    imuAccAlpha = constrain(server.arg("accalpha").toFloat(), 0.02f, 1.0f);
-  }
-
-  if (!slipEnabled) {
-    slipDetected = false;
-    slipCandidateMs = 0.0f;
-  }
-
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Slip config applied");
-}
-
-void handleConfig() {
-  STATE_LOCK();
-  bool wheelChanged = false;
-  if (server.hasArg("wheel")) {
-    int w = server.arg("wheel").toInt();
-    if (w >= 0 && w < 4) {
-      wheelChanged = (activeWheel != (uint8_t)w);
-      activeWheel = (uint8_t)w;
-    }
-  }
-
-  if (server.hasArg("target")) {
-    pidTargetRpm = server.arg("target").toFloat();
-    pidTargetRpm = constrain(pidTargetRpm, 0.0f, TARGET_RPM_MAX);
-  }
-
-  if (server.hasArg("kp")) {
-    float v = server.arg("kp").toFloat();
-    for (uint8_t i = 0; i < 4; i++) pid[i].kp = v;
-  }
-  if (server.hasArg("ki")) {
-    float v = server.arg("ki").toFloat();
-    for (uint8_t i = 0; i < 4; i++) pid[i].ki = v;
-  }
-  if (server.hasArg("kd")) {
-    float v = server.arg("kd").toFloat();
-    for (uint8_t i = 0; i < 4; i++) pid[i].kd = v;
-  }
-
-  if (server.hasArg("minpwm")) {
-    int v = server.arg("minpwm").toInt();
-    minPwm = (uint8_t)constrain(v, 0, PWM_MAX);
-  }
-
-  if (server.hasArg("alpha")) {
-    float a = server.arg("alpha").toFloat();
-    rpmFilterAlpha = constrain(a, 0.02f, 1.0f);
-  }
-
-  if (rawModeEnabled && wheelChanged) {
-    stopAllMotors();
-    setMotorPwmSigned(activeWheel, rawPwmCmd);
-  }
-
-  updateTargets();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Config applied");
-}
-
-void handleMode() {
-  STATE_LOCK();
-  if (server.hasArg("m")) {
-    String m = server.arg("m");
-    if (m == "1" || m == "pos" || m == "position") {
-      controlMode = MODE_POSITION_HEADING;
-    } else {
-      controlMode = MODE_SINGLE_WHEEL_VELOCITY;
-    }
-  }
-
-  if (rawModeEnabled) {
-    stopRawMode();
-  }
-  if (minSweep.active) {
-    stopMinPwmSweep();
-  }
-
-  cancelPoseMove();
-
-  resetHighLevelControllers();
-  updateTargets();
-  bool posMode = (controlMode == MODE_POSITION_HEADING);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", posMode ? "Mode: POSITION+HEADING" : "Mode: SINGLE-WHEEL VELOCITY");
-}
-
-void handleMotionConfig() {
-  STATE_LOCK();
-  if (server.hasArg("pos")) {
-    positionTargetCounts = server.arg("pos").toFloat();
-    positionDone = false;
-    positionDoneTicks = 0;
-  }
-  if (server.hasArg("stepcm")) {
-    positionStepCm = constrain(server.arg("stepcm").toFloat(), -1000.0f, 1000.0f);
-  }
-  if (server.hasArg("wdcm")) {
-    wheelDiameterCm = constrain(server.arg("wdcm").toFloat(), 1.0f, 30.0f);
-  }
-  if (server.hasArg("postol")) {
-    positionTolCm = server.arg("postol").toFloat();
-    positionTolCm = constrain(positionTolCm, 0.1f, 200.0f);
-  }
-
-  if (server.hasArg("pkp")) posPid.kp = server.arg("pkp").toFloat();
-  if (server.hasArg("pki")) posPid.ki = server.arg("pki").toFloat();
-  if (server.hasArg("pkd")) posPid.kd = server.arg("pkd").toFloat();
-  if (server.hasArg("pcruise")) {
-    posCruiseRpm = constrain(server.arg("pcruise").toFloat(), 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("pslow")) {
-    posSlowdownStartCm = constrain(server.arg("pslow").toFloat(), 1.0f, 400.0f);
-  }
-  if (server.hasArg("pfinal")) {
-    posFinalWindowCm = constrain(server.arg("pfinal").toFloat(), 0.5f, 80.0f);
-  }
-  if (server.hasArg("pmin")) {
-    posFinalMinRpm = constrain(server.arg("pmin").toFloat(), 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("pslew")) {
-    posCmdSlewRpmPerSec = constrain(server.arg("pslew").toFloat(), 0.0f, 800.0f);
-  }
-  if (server.hasArg("piband")) {
-    posIntegralBandCm = constrain(server.arg("piband").toFloat(), 1.0f, 300.0f);
-  }
-  if (server.hasArg("pnorev")) {
-    posNoReverseBandCm = constrain(server.arg("pnorev").toFloat(), 0.0f, 25.0f);
-  }
-  if (server.hasArg("pdonerpm")) {
-    posDoneMaxWheelRpm = constrain(server.arg("pdonerpm").toFloat(), 0.2f, 8.0f);
-  }
-  if (server.hasArg("pdonetol")) {
-    posDoneTolCm = constrain(server.arg("pdonetol").toFloat(), 0.2f, 3.0f);
-  }
-  if (server.hasArg("dovr")) {
-    distOvershootCm = constrain(server.arg("dovr").toFloat(), 0.0f, 20.0f);
-  }
-  if (server.hasArg("pdscale")) {
-    distScaleCompPct = constrain(server.arg("pdscale").toFloat(), 0.0f, 10.0f);
-  }
-  if (server.hasArg("pdmax")) {
-    distCompMaxCm = constrain(server.arg("pdmax").toFloat(), 0.0f, 30.0f);
-  }
-  if (server.hasArg("dlong")) {
-    distLongMoveExtraCm = constrain(server.arg("dlong").toFloat(), 0.0f, 20.0f);
-  }
-  if (server.hasArg("dlongstart")) {
-    distLongMoveStartCm = constrain(server.arg("dlongstart").toFloat(), 20.0f, 300.0f);
-  }
-
-  if (server.hasArg("hyaw")) {
-    headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
-  }
-  if (server.hasArg("hkp")) headingPid.kp = server.arg("hkp").toFloat();
-  if (server.hasArg("hki")) headingPid.ki = server.arg("hki").toFloat();
-  if (server.hasArg("hkd")) headingPid.kd = server.arg("hkd").toFloat();
-  if (server.hasArg("hmdb")) {
-    headingMoveDeadbandDeg = constrain(server.arg("hmdb").toFloat(), 0.0f, 10.0f);
-  }
-  if (server.hasArg("hmkiband")) {
-    headingMoveKiErrBandDeg = constrain(server.arg("hmkiband").toFloat(), 0.2f, 40.0f);
-  }
-  if (server.hasArg("hhkp")) headingHoldPid.kp = server.arg("hhkp").toFloat();
-  if (server.hasArg("hhki")) headingHoldPid.ki = server.arg("hhki").toFloat();
-  if (server.hasArg("hhkd")) headingHoldPid.kd = server.arg("hhkd").toFloat();
-  if (server.hasArg("yikiscale")) {
-    yawHoldInPlaceKiScale = constrain(server.arg("yikiscale").toFloat(), 0.0f, 1.5f);
-  }
-  if (server.hasArg("yikiband")) {
-    yawHoldInPlaceKiErrDeg = constrain(server.arg("yikiband").toFloat(), 1.0f, 30.0f);
-  }
-  if (server.hasArg("tbias")) {
-    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
-  }
-  if (server.hasArg("hmax")) {
-    headingCorrMaxRpm = server.arg("hmax").toFloat();
-    headingCorrMaxRpm = constrain(headingCorrMaxRpm, 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("hholdmax")) {
-    headingHoldMaxRpm = server.arg("hholdmax").toFloat();
-    headingHoldMaxRpm = constrain(headingHoldMaxRpm, 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("hholdmin")) {
-    headingHoldMinRpm = constrain(server.arg("hholdmin").toFloat(), 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("hholdminpwm")) {
-    holdMinPwm = (uint8_t)constrain(server.arg("hholdminpwm").toInt(), 0, PWM_MAX);
-  }
-  if (server.hasArg("hhoutrate")) {
-    headingHoldExitRateDps = constrain(server.arg("hhoutrate").toFloat(), 0.0f, 40.0f);
-  }
-  if (server.hasArg("hslew")) {
-    headingCorrSlewRpmPerSec = constrain(server.arg("hslew").toFloat(), 0.0f, 400.0f);
-  }
-  if (server.hasArg("hsign")) {
-    int s = server.arg("hsign").toInt();
-    headingCorrSign = (s >= 0) ? 1 : -1;
-  }
-  if (server.hasArg("hdb")) {
-    headingDeadbandDeg = constrain(server.arg("hdb").toFloat(), 0.0f, 30.0f);
-  }
-  if (server.hasArg("hholddb")) {
-    headingHoldDeadbandDeg = constrain(server.arg("hholddb").toFloat(), 0.0f, 30.0f);
-  }
-  if (server.hasArg("hbase")) {
-    headingEnableBaseRpm = constrain(server.arg("hbase").toFloat(), 0.0f, TARGET_RPM_MAX);
-  }
-  if (server.hasArg("hhold")) {
-    holdHeadingAtStop = server.arg("hhold").toInt() != 0;
-    if (!holdHeadingAtStop) {
-      yawHoldInPlaceMode = false;
-    }
-  }
-
-  if (server.hasArg("alpha")) {
-    float a = server.arg("alpha").toFloat();
-    rpmFilterAlpha = constrain(a, 0.02f, 1.0f);
-  }
-
-  if (headingHoldMinRpm > headingHoldMaxRpm) {
-    headingHoldMinRpm = headingHoldMaxRpm;
-  }
-  if (posFinalMinRpm > posCruiseRpm) {
-    posFinalMinRpm = posCruiseRpm;
-  }
-  if (posFinalWindowCm > posSlowdownStartCm) {
-    posFinalWindowCm = posSlowdownStartCm;
-  }
-
-  resetHighLevelControllers();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Motion config applied");
-}
-
-void handleYawHoldStart() {
-  STATE_LOCK();
-  cancelPoseMove();
-
-  if (rawModeEnabled) {
-    stopRawMode();
-  }
-  if (minSweep.active) {
-    stopMinPwmSweep();
-  }
-
-  if (server.hasArg("hyaw")) {
-    headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
-  }
-  if (server.hasArg("tbias")) {
-    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
-  }
-
-  if (imuOk) {
-    float appliedBias = 0.0f;
-    headingTargetDeg = applyTurnOvershootComp(headingTargetDeg, imuYawDeg, turnOvershootDeg, &appliedBias);
-  }
-
-  if (!imuOk) {
-    controllerEnabled = false;
-    yawHoldInPlaceMode = false;
-    stopAllMotors();
-    STATE_UNLOCK();
-    server.send(200, "text/plain", "Yaw hold aborted: IMU not found");
+void handleCommandLine(String line) {
+  line.trim();
+  if (line.length() == 0) {
     return;
   }
 
-  // Force hold branch active for dedicated yaw-hold tests.
-  holdHeadingAtStop = true;
+  String cmd = firstToken(line);
+  cmd.toUpperCase();
+  uint32_t seq = getUIntArg(line, "seq", 0);
 
-  positionTargetCounts = getAverageMotorEncoderCount();
-  controlMode = MODE_POSITION_HEADING;
-  controllerEnabled = true;
-  yawHoldInPlaceMode = true;
-  resetHighLevelControllers();
-  yawHoldInPlaceMode = true;
-  positionDone = true;
-  positionDoneTicks = 5;
-
-  String msg = "Yaw hold active | targetDeg=" + String(headingTargetDeg, 2) +
-               " | turnBiasDeg=" + String(turnOvershootDeg, 2);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", msg);
-}
-
-void handlePositionStep() {
-  STATE_LOCK();
-  cancelPoseMove();
-
-  int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
-  float stepCm = positionStepCm;
-  if (server.hasArg("stepcm")) {
-    stepCm = constrain(server.arg("stepcm").toFloat(), -1000.0f, 1000.0f);
-  }
-  if (server.hasArg("wdcm")) {
-    wheelDiameterCm = constrain(server.arg("wdcm").toFloat(), 1.0f, 30.0f);
-  }
-  if (server.hasArg("dovr")) {
-    distOvershootCm = constrain(server.arg("dovr").toFloat(), 0.0f, 20.0f);
-  }
-  positionStepCm = stepCm;
-  yawHoldInPlaceMode = false;
-
-  if (rawModeEnabled) {
-    stopRawMode();
-  }
-  if (minSweep.active) {
-    stopMinPwmSweep();
-  }
-
-  float current = getAverageMotorEncoderCount();
-  float stepAbsCm = fabsf(stepCm);
-  float stepBiasCm = computeDistanceCompCm(stepAbsCm);
-  float stepCounts = cmToCounts(stepAbsCm + stepBiasCm);
-  int8_t sign = (dir >= 0) ? 1 : -1;
-  if (stepCm < 0.0f) {
-    sign = -sign;
-  }
-
-  if (imuOk && autoLockHeadingOnStep) {
-    headingTargetDeg = imuYawDeg;
-  }
-
-  positionTargetCounts = current + ((float)sign) * stepCounts;
-  controllerEnabled = true;
-  controlMode = MODE_POSITION_HEADING;
-  resetHighLevelControllers();
-
-  String msg = "Position step started | stepCm=" + String(positionStepCm, 2) +
-               " | distBiasCm=" + String(stepBiasCm, 2) +
-               " | targetCounts=" + String(positionTargetCounts, 1);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", msg);
-}
-
-void handlePoseMove() {
-  STATE_LOCK();
-  cancelPoseMove();
-
-  if (rawModeEnabled) {
-    stopRawMode();
-  }
-  if (minSweep.active) {
-    stopMinPwmSweep();
-  }
-
-  if (server.hasArg("wdcm")) {
-    wheelDiameterCm = constrain(server.arg("wdcm").toFloat(), 1.0f, 30.0f);
-  }
-
-  float distCm = server.hasArg("distcm") ? server.arg("distcm").toFloat() : positionStepCm;
-  distCm = constrain(distCm, -1000.0f, 1000.0f);
-
-  if (server.hasArg("tbias")) {
-    turnOvershootDeg = constrain(server.arg("tbias").toFloat(), 0.0f, 20.0f);
-  }
-
-  if (server.hasArg("hyaw")) {
-    headingTargetDeg = wrapAngleDeg(server.arg("hyaw").toFloat());
-  }
-
-  poseMoveRequestedYawDeg = headingTargetDeg;
-  poseMoveAppliedBiasDeg = 0.0f;
-  if (imuOk) {
-    headingTargetDeg = applyTurnOvershootComp(poseMoveRequestedYawDeg, imuYawDeg, turnOvershootDeg, &poseMoveAppliedBiasDeg);
-  }
-
-  float startHeadingErrDeg = fabs(shortestAngleErrorDeg(headingTargetDeg, imuYawDeg));
-
-  if (server.hasArg("ttmo")) {
-    poseMoveTurnTimeoutMs = (uint32_t)constrain(server.arg("ttmo").toInt(), 2000, 30000);
-  } else {
-    poseMoveTurnTimeoutMs = computePoseTurnTimeoutMs(headingTargetDeg, imuYawDeg, headingHoldMaxRpm);
-  }
-  if (startHeadingErrDeg >= 60.0f && poseMoveTurnTimeoutMs < 12000) {
-    // Keep a generous safety floor for large-angle turns.
-    poseMoveTurnTimeoutMs = 12000;
-  }
-
-  if (!imuOk) {
-    controllerEnabled = false;
-    yawHoldInPlaceMode = false;
-    cancelPoseMove(3);
-    stopAllMotors();
-    STATE_UNLOCK();
-    server.send(200, "text/plain", "Pose move aborted: IMU not found");
+  if (cmd == "PING") {
+    sendJsonLine("{\"type\":\"pong\",\"seq\":" + String(seq) + ",\"ok\":true}");
     return;
   }
 
-  poseMoveDistanceCm = distCm;
-  float poseBiasAbsCm = computeDistanceCompCm(fabsf(poseMoveDistanceCm));
-  poseMoveAppliedDistBiasCm = (poseMoveDistanceCm >= 0.0f) ? poseBiasAbsCm : -poseBiasAbsCm;
-  poseMoveStartCounts = getAverageMotorEncoderCount();
-  poseMoveTargetCounts = poseMoveStartCounts + cmToCounts(poseMoveDistanceCm + poseMoveAppliedDistBiasCm);
-
-  holdHeadingAtStop = true;
-  controlMode = MODE_POSITION_HEADING;
-  controllerEnabled = true;
-  resetHighLevelControllers();
-  poseMoveLastResult = 0;
-
-  poseMoveActive = true;
-  poseMovePhase = 1;
-  poseMovePhaseStartMs = millis();
-  poseMoveTurnOnly = fabsf(poseMoveDistanceCm) <= 0.5f;
-  yawHoldInPlaceMode = true;
-  positionTargetCounts = poseMoveStartCounts;
-  positionDone = true;
-  positionDoneTicks = 5;
-
-  String msg = "Pose move started | distCm=" + String(poseMoveDistanceCm, 2) +
-               " | distBiasCm=" + String(poseMoveAppliedDistBiasCm, 2) +
-               " | reqYawDeg=" + String(poseMoveRequestedYawDeg, 2) +
-               " | targetYawDeg=" + String(headingTargetDeg, 2) +
-               " | appliedBiasDeg=" + String(poseMoveAppliedBiasDeg, 2) +
-               " | startErrDeg=" + String(startHeadingErrDeg, 2) +
-               " | turnTimeoutMs=" + String(poseMoveTurnTimeoutMs);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", msg);
-}
-
-void handleImuZero() {
-  STATE_LOCK();
-  imuZeroYaw();
-  resetCascadePid(headingPid);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "IMU yaw zeroed");
-}
-
-void handleImuCal() {
-  STATE_LOCK();
-  bool ok = imuCalibrateBias(500);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", ok ? "IMU bias calibrated" : "IMU calibration failed");
-}
-
-void handleRawStart() {
-  STATE_LOCK();
-  int pwm = server.hasArg("pwm") ? server.arg("pwm").toInt() : PWM_MAX;
-  startRawMode((int16_t)pwm);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Raw mode started");
-}
-
-void handleRawStop() {
-  STATE_LOCK();
-  stopRawMode();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Raw mode stopped");
-}
-
-void handleMinPwmStart() {
-  STATE_LOCK();
-  if (rawModeEnabled) {
-    stopRawMode();
+  if (cmd == "STATUS") {
+    sendJsonLine(buildAckJson(seq, "STATUS", true, "telemetry_follows"));
+    STATE_LOCK();
+    String s = buildTelemetryJson();
+    STATE_UNLOCK();
+    sendJsonLine(s);
+    return;
   }
 
-  int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
-  int start = server.hasArg("start") ? server.arg("start").toInt() : 20;
-  int end = server.hasArg("end") ? server.arg("end").toInt() : 90;
-  int step = server.hasArg("step") ? server.arg("step").toInt() : 2;
-  int hold = server.hasArg("hold") ? server.arg("hold").toInt() : 700;
-
-  startMinPwmSweep((dir >= 0) ? 1 : -1, (uint8_t)start, (uint8_t)end, (uint8_t)step, (uint16_t)hold);
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "MinPWM sweep started");
-}
-
-void handleMinPwmStop() {
-  STATE_LOCK();
-  stopMinPwmSweep();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "MinPWM sweep stopped");
-}
-
-void handleStart() {
-  STATE_LOCK();
-  cancelPoseMove();
-
-  if (rawModeEnabled) {
-    stopRawMode();
+  if (cmd == "STOP") {
+    STATE_LOCK();
+    cancelActiveCommand(2);
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "STOP", true, "stopped"));
+    return;
   }
 
-  if (minSweep.active) {
-    stopMinPwmSweep();
+  if (cmd == "ZERO_IMU") {
+    STATE_LOCK();
+    imuZeroYaw();
+    headingTargetDeg = 0.0f;
+    resetHighLevelControllers();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "ZERO_IMU", true, "yaw_zeroed"));
+    return;
   }
 
-  resetHighLevelControllers();
+  if (cmd == "CAL_IMU") {
+    bool ok = false;
+    STATE_LOCK();
+    cancelActiveCommand(2);
+    ok = imuCalibrateBias(IMU_BIAS_CAL_SAMPLES);
+    resetHighLevelControllers();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "CAL_IMU", ok, ok ? "imu_bias_calibrated" : "imu_calibration_failed"));
+    return;
+  }
 
-  if (controlMode == MODE_POSITION_HEADING) {
-    // In Mode 1, Start means execute one relative distance step from current pose.
-    yawHoldInPlaceMode = false;
-    float current = getAverageMotorEncoderCount();
-    if (imuOk && autoLockHeadingOnStep) {
-      headingTargetDeg = imuYawDeg;
+  if (cmd == "INIT_IMU") {
+    bool ok = false;
+    STATE_LOCK();
+    cancelActiveCommand(2);
+    ok = imuCalibrateBias(IMU_BIAS_CAL_SAMPLES);
+    if (ok) {
+      imuZeroYaw();
+      headingTargetDeg = 0.0f;
     }
-    positionTargetCounts = current + cmToCounts(positionStepCm);
+    resetHighLevelControllers();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "INIT_IMU", ok, ok ? "imu_calibrated_and_zeroed" : "imu_calibration_failed"));
+    return;
   }
 
-  controllerEnabled = true;
-  updateTargets();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Controller started");
-}
-
-void handleStop() {
-  STATE_LOCK();
-  cancelPoseMove();
-
-  if (rawModeEnabled) {
-    stopRawMode();
+  if (cmd == "RESET_ENC") {
+    STATE_LOCK();
+    resetEncoders();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "RESET_ENC", true, "encoders_reset"));
+    return;
   }
 
-  if (minSweep.active) {
-    stopMinPwmSweep();
+  if (cmd == "RESET_ODOM") {
+    STATE_LOCK();
+    resetEncoders();
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "RESET_ODOM", true, "odometry_reset"));
+    return;
   }
-  controllerEnabled = false;
-  yawHoldInPlaceMode = false;
-  updateTargets();
-  resetAllPidStates();
-  resetHighLevelControllers();
-  stopAllMotors();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Controller stopped");
-}
 
-void handleResetI() {
-  STATE_LOCK();
-  resetAllPidStates();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "PID integrators reset");
-}
+  if (cmd == "MOVE") {
+    float angleDeg = getFloatArg(line, "angle", 0.0f);
+    float distCm = getFloatArg(line, "dist", 0.0f);
+    float speedRpm = getFloatArg(line, "speed", posCruiseRpm);
+    float headingDeg = getFloatArg(line, "heading", imuYawDeg);
+    uint32_t timeoutMs = getUIntArg(line, "timeout", 0);
 
-void handleResetEnc() {
-  STATE_LOCK();
-  resetEncoders();
-  STATE_UNLOCK();
-  server.send(200, "text/plain", "Encoders reset");
+    STATE_LOCK();
+    if (!imuOk) {
+      STATE_UNLOCK();
+      sendJsonLine(buildAckJson(seq, "MOVE", false, "imu_missing"));
+      return;
+    }
+    startMoveSequence(seq, angleDeg, distCm, speedRpm, headingDeg, timeoutMs);
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "MOVE", true, "accepted"));
+    return;
+  }
+
+  if (cmd == "TURN") {
+    float headingDeg = getFloatArg(line, "heading", imuYawDeg);
+    float speedRpm = getFloatArg(line, "speed", headingHoldMaxRpm);
+    uint32_t timeoutMs = getUIntArg(line, "timeout", 0);
+
+    STATE_LOCK();
+    if (!imuOk) {
+      STATE_UNLOCK();
+      sendJsonLine(buildAckJson(seq, "TURN", false, "imu_missing"));
+      return;
+    }
+    startMoveSequence(seq, 0.0f, 0.0f, speedRpm, headingDeg, timeoutMs);
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "TURN", true, "accepted"));
+    return;
+  }
+
+  if (cmd == "TWIST") {
+    float forwardRpm = getFloatArg(line, "forward", 0.0f);
+    float strafeRpm = getFloatArg(line, "strafe", 0.0f);
+    float turnRpm = getFloatArg(line, "turn", 0.0f);
+    uint32_t timeoutMs = getUIntArg(line, "timeout", 1000);
+
+    STATE_LOCK();
+    startTwist(seq, forwardRpm, strafeRpm, turnRpm, timeoutMs);
+    STATE_UNLOCK();
+    sendJsonLine(buildAckJson(seq, "TWIST", true, "accepted"));
+    return;
+  }
+
+  sendJsonLine(buildAckJson(seq, "UNKNOWN", false, "unknown_command"));
 }
 
 void controlTaskFn(void* arg) {
+  (void)arg;
   TickType_t lastWake = xTaskGetTickCount();
+  uint32_t lastControlMs = millis();
+
   for (;;) {
     STATE_LOCK();
     uint32_t now = millis();
-    if (now - lastControlMs >= CONTROL_INTERVAL_MS) {
-      float dt = (now - lastControlMs) / 1000.0f;
-      lastControlMs = now;
-      if (dt < 0.001f) dt = CONTROL_INTERVAL_MS / 1000.0f;
-
-      if (minSweep.active) {
-        updateMeasuredRpm(dt);
-        updateMinPwmSweep(now);
-      } else if (rawModeEnabled) {
-        updateMeasuredRpm(dt);
-        stopAllMotors();
-        setMotorPwmSigned(activeWheel, rawPwmCmd);
-      } else {
-        runControlLoop(dt);
-      }
+    float dt = (now - lastControlMs) / 1000.0f;
+    lastControlMs = now;
+    if (dt < 0.001f) {
+      dt = CONTROL_INTERVAL_MS / 1000.0f;
     }
+
+    updateMeasuredRpm(dt);
+    imuUpdate(dt);
+
+    if (commandMode == CMD_TWIST) {
+      updateTwistTargets();
+    } else {
+      updateHighLevelTargets(dt);
+    }
+    runWheelPid(dt);
     STATE_UNLOCK();
+
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(CONTROL_INTERVAL_MS));
   }
 }
 
-void webTaskFn(void* arg) {
+void uartRxTaskFn(void* arg) {
+  (void)arg;
+  char lineBuf[UART_LINE_MAX];
+  size_t idx = 0;
+
   for (;;) {
-    server.handleClient();
-    vTaskDelay(1);
+    while (Serial.available() > 0) {
+      char c = (char)Serial.read();
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        lineBuf[idx] = '\0';
+        handleCommandLine(String(lineBuf));
+        idx = 0;
+        continue;
+      }
+      if (idx + 1 < UART_LINE_MAX) {
+        lineBuf[idx++] = c;
+      } else {
+        idx = 0;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 void telemetryTaskFn(void* arg) {
+  (void)arg;
+  uint32_t lastTelemetryMs = 0;
+
   for (;;) {
+    uint32_t doneSeq = 0;
+    uint8_t doneCode = 0;
+    bool sendDone = false;
+    String telemetry;
+
+    STATE_LOCK();
     uint32_t now = millis();
-    if (now - lastPrintMs >= 1000) {
-      lastPrintMs = now;
-      Serial.print("RPM BR/FR/BL/FL: ");
-      Serial.print(measuredRpm[0], 1);
-      Serial.print(" / ");
-      Serial.print(measuredRpm[1], 1);
-      Serial.print(" / ");
-      Serial.print(measuredRpm[2], 1);
-      Serial.print(" / ");
-      Serial.print(measuredRpm[3], 1);
-      Serial.print(" | PWM: ");
-      Serial.print(pwmCmd[0]);
-      Serial.print(",");
-      Serial.print(pwmCmd[1]);
-      Serial.print(",");
-      Serial.print(pwmCmd[2]);
-      Serial.print(",");
-      Serial.print(pwmCmd[3]);
-      Serial.print(" | MinSweep active=");
-      Serial.print(minSweep.active ? "1" : "0");
-      Serial.print(" current=");
-      Serial.print(minSweep.currentPwm);
-      Serial.print(" detected=");
-      Serial.print(minSweep.detectedPwm);
-      Serial.print(" | Raw=");
-      Serial.print(rawModeEnabled ? "1" : "0");
-      Serial.print(" pwm=");
-      Serial.print(rawPwmCmd);
-      Serial.print(" | Mode=");
-      Serial.print(controlMode == MODE_POSITION_HEADING ? "POS" : "VEL");
-      Serial.print(" | Yaw=");
-      Serial.print(imuYawDeg, 1);
-      Serial.print(" | PosErr=");
-      Serial.println(positionErrorCounts, 1);
+    if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+      updateBodyCounts();
+      telemetry = buildTelemetryJson();
+      lastTelemetryMs = now;
+    }
+    if (pendingDoneEvent) {
+      sendDone = true;
+      doneSeq = pendingDoneSeq;
+      doneCode = pendingDoneCode;
+      pendingDoneEvent = false;
+    }
+    STATE_UNLOCK();
+
+    if (telemetry.length() > 0) {
+      sendJsonLine(telemetry);
+    }
+    if (sendDone) {
+      sendJsonLine(buildDoneJson(doneSeq, doneCode));
     }
 
-    if (debugSerialEnabled && (now - lastDebugSerialMs >= debugSerialPeriodMs)) {
-      lastDebugSerialMs = now;
-      Serial.print("DBG,t=");
-      Serial.print(now);
-      Serial.print(",ph=");
-      Serial.print(debugYawPhase);
-      Serial.print(",eRaw=");
-      Serial.print(debugRawHeadingErrDeg, 3);
-      Serial.print(",eUse=");
-      Serial.print(debugUsedHeadingErrDeg, 3);
-      Serial.print(",gyro=");
-      Serial.print(imuGyroDps, 3);
-      Serial.print(",gyroF=");
-      Serial.print(imuGyroDpsFilt, 3);
-      Serial.print(",corrT=");
-      Serial.print(debugCorrTargetRpm, 3);
-      Serial.print(",corr=");
-      Serial.print(debugCorrAfterSlewRpm, 3);
-      Serial.print(",setE=");
-      Serial.print(debugErrSettled ? 1 : 0);
-      Serial.print(",setR=");
-      Serial.print(debugRateSettled ? 1 : 0);
-      Serial.print(",tr=");
-      Serial.print(targetRpm[0], 2); Serial.print("/");
-      Serial.print(targetRpm[1], 2); Serial.print("/");
-      Serial.print(targetRpm[2], 2); Serial.print("/");
-      Serial.print(targetRpm[3], 2);
-      Serial.print(",mr=");
-      Serial.print(measuredRpm[0], 2); Serial.print("/");
-      Serial.print(measuredRpm[1], 2); Serial.print("/");
-      Serial.print(measuredRpm[2], 2); Serial.print("/");
-      Serial.print(measuredRpm[3], 2);
-      Serial.print(",pwm=");
-      Serial.print(pwmCmd[0]); Serial.print("/");
-      Serial.print(pwmCmd[1]); Serial.print("/");
-      Serial.print(pwmCmd[2]); Serial.print("/");
-      Serial.println(pwmCmd[3]);
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
 void setup() {
-  Serial.begin(115200);
+  stateMutex = xSemaphoreCreateMutex();
+  serialMutex = xSemaphoreCreateMutex();
+
+  Serial.begin(UART_BAUD);
+  Serial.setTimeout(5);
   delay(300);
 
   imuInit();
@@ -3296,154 +1636,15 @@ void setup() {
 
   stopAllMotors();
   resetEncoders();
-  resetAllPidStates();
-  updateTargets();
+  resetHighLevelControllers();
 
-  WiFi.mode(WIFI_AP);
-  bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
+  xTaskCreatePinnedToCore(controlTaskFn, "control", 8192, nullptr, 5, &controlTaskHandle, 1);
+  xTaskCreatePinnedToCore(uartRxTaskFn, "uart_rx", 6144, nullptr, 3, &uartRxTaskHandle, 0);
+  xTaskCreatePinnedToCore(telemetryTaskFn, "telemetry", 6144, nullptr, 2, &telemetryTaskHandle, 0);
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/data", HTTP_GET, handleData);
-  server.on("/cmd/debugConfig", HTTP_GET, handleDebugConfig);
-  server.on("/cmd/config", HTTP_GET, handleConfig);
-  server.on("/cmd/rpmSign", HTTP_GET, handleRpmSign);
-  server.on("/cmd/slipConfig", HTTP_GET, handleSlipConfig);
-  server.on("/cmd/mode", HTTP_GET, handleMode);
-  server.on("/cmd/motionConfig", HTTP_GET, handleMotionConfig);
-  server.on("/cmd/posStep", HTTP_GET, handlePositionStep);
-  server.on("/cmd/poseMove", HTTP_GET, handlePoseMove);
-  server.on("/cmd/yawHoldStart", HTTP_GET, handleYawHoldStart);
-  server.on("/cmd/imuZero", HTTP_GET, handleImuZero);
-  server.on("/cmd/imuCal", HTTP_GET, handleImuCal);
-  server.on("/cmd/start", HTTP_GET, handleStart);
-  server.on("/cmd/stop", HTTP_GET, handleStop);
-  server.on("/cmd/resetI", HTTP_GET, handleResetI);
-  server.on("/cmd/resetEnc", HTTP_GET, handleResetEnc);
-  server.on("/cmd/rawStart", HTTP_GET, handleRawStart);
-  server.on("/cmd/rawStop", HTTP_GET, handleRawStop);
-  server.on("/cmd/minpwmStart", HTTP_GET, handleMinPwmStart);
-  server.on("/cmd/minpwmStop", HTTP_GET, handleMinPwmStop);
-  server.begin();
-
-  Serial.println();
-  Serial.println("Wheel PID tuner started.");
-  Serial.print("AP started: ");
-  Serial.println(apOk ? "YES" : "NO");
-  Serial.print("SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print("PASS: ");
-  Serial.println(AP_PASS);
-  Serial.print("IP: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.print("IMU: ");
-  Serial.println(imuOk ? "OK" : "NOT FOUND");
-
-  stateMutex = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(controlTaskFn,   "control",    8192, nullptr, 5, &controlTaskHandle,   1);
-  xTaskCreatePinnedToCore(webTaskFn,       "web",       12288, nullptr, 2, &webTaskHandle,       0);
-  xTaskCreatePinnedToCore(telemetryTaskFn, "telemetry",  4096, nullptr, 1, &telemetryTaskHandle, 0);
+  sendJsonLine("{\"type\":\"ready\",\"baud\":115200,\"imu\":" + String(imuOk ? "true" : "false") + "}");
 }
 
 void loop() {
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
-
-// --- Legacy loop body (preserved for reference only; actual work runs in tasks above) ---
-#if 0
-void legacyLoop() {
-  server.handleClient();
-
-  uint32_t now = millis();
-  if (now - lastControlMs >= CONTROL_INTERVAL_MS) {
-    float dt = (now - lastControlMs) / 1000.0f;
-    lastControlMs = now;
-    if (dt < 0.001f) dt = CONTROL_INTERVAL_MS / 1000.0f;
-
-    if (minSweep.active) {
-      updateMeasuredRpm(dt);
-      updateMinPwmSweep(now);
-    } else if (rawModeEnabled) {
-      updateMeasuredRpm(dt);
-      stopAllMotors();
-      setMotorPwmSigned(activeWheel, rawPwmCmd);
-    } else {
-      runControlLoop(dt);
-    }
-  }
-
-  if (now - lastPrintMs >= 1000) {
-    lastPrintMs = now;
-    Serial.print("RPM BR/FR/BL/FL: ");
-    Serial.print(measuredRpm[0], 1);
-    Serial.print(" / ");
-    Serial.print(measuredRpm[1], 1);
-    Serial.print(" / ");
-    Serial.print(measuredRpm[2], 1);
-    Serial.print(" / ");
-    Serial.print(measuredRpm[3], 1);
-    Serial.print(" | PWM: ");
-    Serial.print(pwmCmd[0]);
-    Serial.print(",");
-    Serial.print(pwmCmd[1]);
-    Serial.print(",");
-    Serial.print(pwmCmd[2]);
-    Serial.print(",");
-    Serial.print(pwmCmd[3]);
-    Serial.print(" | MinSweep active=");
-    Serial.print(minSweep.active ? "1" : "0");
-    Serial.print(" current=");
-    Serial.print(minSweep.currentPwm);
-    Serial.print(" detected=");
-    Serial.print(minSweep.detectedPwm);
-    Serial.print(" | Raw=");
-    Serial.print(rawModeEnabled ? "1" : "0");
-    Serial.print(" pwm=");
-    Serial.print(rawPwmCmd);
-    Serial.print(" | Mode=");
-    Serial.print(controlMode == MODE_POSITION_HEADING ? "POS" : "VEL");
-    Serial.print(" | Yaw=");
-    Serial.print(imuYawDeg, 1);
-    Serial.print(" | PosErr=");
-    Serial.println(positionErrorCounts, 1);
-  }
-
-  if (debugSerialEnabled && (now - lastDebugSerialMs >= debugSerialPeriodMs)) {
-    lastDebugSerialMs = now;
-    Serial.print("DBG,t=");
-    Serial.print(now);
-    Serial.print(",ph=");
-    Serial.print(debugYawPhase);
-    Serial.print(",eRaw=");
-    Serial.print(debugRawHeadingErrDeg, 3);
-    Serial.print(",eUse=");
-    Serial.print(debugUsedHeadingErrDeg, 3);
-    Serial.print(",gyro=");
-    Serial.print(imuGyroDps, 3);
-    Serial.print(",gyroF=");
-    Serial.print(imuGyroDpsFilt, 3);
-    Serial.print(",corrT=");
-    Serial.print(debugCorrTargetRpm, 3);
-    Serial.print(",corr=");
-    Serial.print(debugCorrAfterSlewRpm, 3);
-    Serial.print(",setE=");
-    Serial.print(debugErrSettled ? 1 : 0);
-    Serial.print(",setR=");
-    Serial.print(debugRateSettled ? 1 : 0);
-    Serial.print(",tr=");
-    Serial.print(targetRpm[0], 2); Serial.print("/");
-    Serial.print(targetRpm[1], 2); Serial.print("/");
-    Serial.print(targetRpm[2], 2); Serial.print("/");
-    Serial.print(targetRpm[3], 2);
-    Serial.print(",mr=");
-    Serial.print(measuredRpm[0], 2); Serial.print("/");
-    Serial.print(measuredRpm[1], 2); Serial.print("/");
-    Serial.print(measuredRpm[2], 2); Serial.print("/");
-    Serial.print(measuredRpm[3], 2);
-    Serial.print(",pwm=");
-    Serial.print(pwmCmd[0]); Serial.print("/");
-    Serial.print(pwmCmd[1]); Serial.print("/");
-    Serial.print(pwmCmd[2]); Serial.print("/");
-    Serial.println(pwmCmd[3]);
-  }
-}
-#endif
