@@ -1,0 +1,8 @@
+float32 forward_rpm
+float32 strafe_rpm
+float32 turn_rpm
+float32 timeout_s
+---
+bool ok
+string message
+string raw_json

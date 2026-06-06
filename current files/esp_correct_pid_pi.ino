@@ -200,6 +200,7 @@ const float RPM_FILTER_ALPHA = 0.20f;
 const uint32_t UART_BAUD = 115200;
 const size_t UART_LINE_MAX = 180;
 const uint32_t PI_TELEMETRY_INTERVAL_MS = 100;
+const uint8_t DEFAULT_LIMIT_STATUS_PIN = 23;
 const uint32_t TIMED_RUN_MIN_MS = 250;
 const uint32_t TIMED_RUN_MAX_MS = 120000;
 
@@ -227,7 +228,11 @@ float targetScale = 1.0f;
 int8_t strafeSign = -1;
 int8_t rotateSign = -1;
 int8_t odomForwardSign = 1;
-int8_t odomStrafeSign = 1;
+// On this mecanum base, the wheel pattern that physically strafes right
+// produces negative raw strafe odometry. Keep the command sign from
+// correct_pid.ino, but invert displayed strafe odometry so Pi position moves
+// close their lateral error instead of driving forever.
+int8_t odomStrafeSign = -1;
 int8_t odomYawSign = -1;
 float odomForwardScale = 0.9854f;
 float odomStrafeScale = 0.9375f;
@@ -1146,6 +1151,19 @@ String buildPiAckJson(uint32_t seq, const char* cmd, bool ok, const String& mess
   return s;
 }
 
+String buildPiLimitStatusJson(uint32_t seq, uint8_t pin, bool activeLow, int raw) {
+  bool pressed = activeLow ? raw == LOW : raw == HIGH;
+  String s;
+  s.reserve(140);
+  s += "{\"type\":\"limit\",\"seq\":" + String(seq);
+  s += ",\"pin\":" + String(pin);
+  s += ",\"pressed\":" + String(pressed ? "true" : "false");
+  s += ",\"raw\":" + String(raw);
+  s += ",\"activeLow\":" + String(activeLow ? "true" : "false");
+  s += "}";
+  return s;
+}
+
 String buildPiDoneJson(uint32_t seq, uint8_t code) {
   String s;
   s.reserve(220);
@@ -1301,6 +1319,44 @@ void startPiPositionMove(uint32_t seq, float angleDeg, float distanceCm, float h
   updatePositionController(NOMINAL_DT_S);
 }
 
+void startPiTwist(float forwardRpm, float strafeRpm, float turnRpm, uint32_t timeoutMs) {
+  if (piActiveSeq != 0) {
+    stopPiMotion(2);
+  }
+
+  latchPiMoveOdom();
+  piActiveSeq = 0;
+  positionModeActive = false;
+  positionTargetReached = false;
+  timedRunActive = false;
+  timedRunStartMs = 0;
+
+  commandForwardRpm = constrain(forwardRpm, -RPM_TARGET_LIMIT, RPM_TARGET_LIMIT);
+  commandStrafeRpm = constrain(strafeRpm, -RPM_TARGET_LIMIT, RPM_TARGET_LIMIT);
+  commandRotateRpm = constrain(turnRpm, -RPM_TARGET_LIMIT, RPM_TARGET_LIMIT);
+  updateMecanumTargets();
+
+  if (fabsf(commandForwardRpm) <= 0.001f &&
+      fabsf(commandStrafeRpm) <= 0.001f &&
+      fabsf(commandRotateRpm) <= 0.001f) {
+    controllerEnabled = false;
+    resetAllPiStates();
+    resetAllBodyPiStates();
+    stopAllMotors();
+    return;
+  }
+
+  timedRunDurationMs = timeoutMs < 50 ? 50 : timeoutMs;
+  timedRunStartMs = millis();
+  timedRunId++;
+  if (timedRunId == 0) timedRunId = 1;
+  timedRunActive = true;
+  controllerEnabled = true;
+  resetAllPiStates();
+  resetAllBodyPiStates();
+  resetRpmMeasurementsToCurrentCounts();
+}
+
 void handlePiCommandLine(String line) {
   line.trim();
   if (line.length() == 0) {
@@ -1322,6 +1378,16 @@ void handlePiCommandLine(String line) {
     String telemetry = buildPiTelemetryJson();
     STATE_UNLOCK();
     sendJsonLine(telemetry);
+    return;
+  }
+
+  if (cmd == "LIMIT_STATUS") {
+    uint8_t pin = (uint8_t)getUIntArg(line, "pin", DEFAULT_LIMIT_STATUS_PIN);
+    bool activeLow = getUIntArg(line, "activeLow", 1) != 0;
+    pinMode(pin, activeLow ? INPUT_PULLUP : INPUT);
+    delayMicroseconds(50);
+    int raw = digitalRead(pin);
+    sendJsonLine(buildPiLimitStatusJson(seq, pin, activeLow, raw));
     return;
   }
 
@@ -1408,6 +1474,18 @@ void handlePiCommandLine(String line) {
     startPiPositionMove(seq, angleDeg, distCm, headingDeg);
     STATE_UNLOCK();
     sendJsonLine(buildPiAckJson(seq, "MOVE", true, "accepted"));
+    return;
+  }
+
+  if (cmd == "TWIST") {
+    float forwardRpm = getFloatArg(line, "forward", 0.0f);
+    float strafeRpm = getFloatArg(line, "strafe", 0.0f);
+    float turnRpm = getFloatArg(line, "turn", 0.0f);
+    uint32_t timeoutMs = getUIntArg(line, "timeout", 300);
+    STATE_LOCK();
+    startPiTwist(forwardRpm, strafeRpm, turnRpm, timeoutMs);
+    STATE_UNLOCK();
+    sendJsonLine(buildPiAckJson(seq, "TWIST", true, "accepted"));
     return;
   }
 
@@ -1631,7 +1709,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         <label>Odom Strafe Sign
           <select id="odomStrafeSign">
             <option value="1">Normal</option>
-            <option value="-1">Invert</option>
+            <option value="-1" selected>Invert</option>
           </select>
         </label>
         <label>Odom Rotate Sign

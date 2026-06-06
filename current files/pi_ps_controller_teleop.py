@@ -38,8 +38,8 @@ TELEOP_ACK_TIMEOUT_S = 0.20
 BUZZER_HONK_MAX_S = 2.0
 
 STEPPER_JOG_STEPS = 100
-STEPPER_UP_DIR = -1
-STEPPER_DOWN_DIR = 1
+STEPPER_UP_DIR = 1
+STEPPER_DOWN_DIR = -1
 
 HOMING_LIMIT_PIN = 23
 HOMING_CHUNK_STEPS = 25
@@ -296,7 +296,7 @@ class BackgroundActions:
         thread.start()
 
     def _stepper_hold_worker(self, direction: int, stop_event: threading.Event) -> None:
-        text = "up" if direction < 0 else "down"
+        text = "up" if direction > 0 else "down"
         print(f"stepper | hold {text}")
         self.supervisor.stepper.run_until_released(
             direction,

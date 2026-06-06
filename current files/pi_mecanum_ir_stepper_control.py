@@ -83,9 +83,10 @@ YELLOW_LED_PIN = 20
 GREEN_LED_PIN = 16
 RED_LED_PIN = 21
 STEP_HIGH_US = 10
-STEPPER_SPEED_SPS = 100.0
+STEPPER_SPEED_SPS = 275.0
 STEPPER_DEFAULT_STEPS = 200
-STEPPER_DEFAULT_DIRECTION = 1
+STEPPER_DEFAULT_DIRECTION = 1  # +1 is lift up; -1 is lift down.
+STEPPER_DIR_SETUP_S = 0.010
 
 
 @dataclass
@@ -276,6 +277,7 @@ class StepperController:
             else:
                 self.dir_pin.off()
             self.en_pin.off()
+            time.sleep(STEPPER_DIR_SETUP_S)
 
         if self.on_motion_start is not None:
             self.on_motion_start()
@@ -664,7 +666,7 @@ def initialize_robot(link: EspPiControlLink) -> None:
     if ack is None:
         raise RuntimeError(
             "ESP answered PING earlier, but did not answer INIT_IMU or CAL_IMU. "
-            "Flash esp_mecanum_pi_control_ir_stepper.ino, then reset the ESP and retry."
+            "Flash esp_correct_pid_pi.ino, then reset the ESP and retry."
         )
 
     require_ok_ack(ack)

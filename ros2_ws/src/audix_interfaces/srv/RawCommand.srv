@@ -1,0 +1,9 @@
+string command
+float32 timeout_s
+bool wait_for_done
+---
+bool ok
+string type
+string result
+string message
+string raw_json

@@ -10,7 +10,7 @@ ROS running on the Pi:
 - runs the simple-cardinal obstacle decision logic locally
 - sends position commands to the ESP32 position PID controller
 
-The matching ESP sketch is esp_pid.ino.
+The matching ESP sketch is esp_correct_pid_pi.ino.
 """
 
 import argparse
@@ -36,17 +36,49 @@ PING_TIMEOUT_S = 2.5
 ACK_TIMEOUT_S = 3.0
 INIT_TIMEOUT_S = 8.0
 
-# These defaults mirror esp_pid.ino. Keep this block aligned with the sketch's
-# serial command layer and odometry configuration.
+# These defaults mirror esp_correct_pid_pi.ino. Keep this block aligned with the
+# sketch's serial command layer and odometry configuration.
 ESP_DEFAULT_BAUD = 115200
 ESP_SERIAL_TELEMETRY_INTERVAL_S = 0.05
 ESP_SERIAL_COMMAND_TIMEOUT_S = 0.5
 ESP_POSITION_MOVE_TIMEOUT_S = 180.0
 
+# Raspberry Pi BCM GPIO outputs.
+# Physical pins:
+#   IR JST A: GPIO23 pin16, GPIO24 pin18, GPIO25 pin22, GND pin20
+#   IR JST B: GPIO17 pin11, GPIO27 pin13, GPIO22 pin15
+#   Stepper: EN GPIO5 pin29, STEP GPIO6 pin31, DIR GPIO13 pin33
+#   Buzzer: GPIO19 pin35
+#   Traffic: green GPIO16 pin36, yellow GPIO20 pin38, red GPIO21 pin40
+STEPPER_STEP_PIN = 6
+STEPPER_DIR_PIN = 13
+STEPPER_EN_PIN = 5
+STEPPER_STEP_HIGH_US = 10
+STEPPER_DIR_SETUP_S = 0.010
+STEPPER_SPEED_SPS = 275.0
+STEPPER_DEFAULT_STEPS = 200
+STEPPER_UP_DIR = 1
+STEPPER_DOWN_DIR = -1
+DEFAULT_BUZZER_PIN = 19
+TRAFFIC_YELLOW_LED_PIN = 20
+TRAFFIC_GREEN_LED_PIN = 16
+TRAFFIC_RED_LED_PIN = 21
+
+HARDWARE_OUTPUT_PINS = {
+    "stepper_step": STEPPER_STEP_PIN,
+    "stepper_dir": STEPPER_DIR_PIN,
+    "stepper_enable": STEPPER_EN_PIN,
+    "buzzer": DEFAULT_BUZZER_PIN,
+    "traffic_yellow": TRAFFIC_YELLOW_LED_PIN,
+    "traffic_green": TRAFFIC_GREEN_LED_PIN,
+    "traffic_red": TRAFFIC_RED_LED_PIN,
+}
+
 IR_SENSOR_ORDER = ("front_left", "front", "front_right", "right", "back", "left")
 IR_PINS = {
     "front_left": 23,
     "front": 24,
+    "front_right": 25,
     "right": 17,
     "back": 27,
     "left": 22,
@@ -296,6 +328,192 @@ class GpioIrBank:
     def close(self) -> None:
         for device in self.devices.values():
             device.close()
+
+
+class GpioBuzzer:
+    def __init__(self, *, pin: int | None, active_high: bool, enabled: bool, mock: bool) -> None:
+        self.pin = pin
+        self.device = None
+        self.enabled = bool(enabled and pin is not None and not mock)
+        if not self.enabled:
+            return
+
+        try:
+            ensure_gpiozero_runtime()
+            from gpiozero import OutputDevice
+
+            self.device = OutputDevice(pin, active_high=active_high, initial_value=False)
+            print(
+                f"gpio | buzzer GPIO{pin} active_high={1 if active_high else 0}",
+                flush=True,
+            )
+        except SystemExit as exc:
+            print(f"warn | buzzer GPIO{pin} unavailable; buzzer disabled: {exc}", flush=True)
+            self.device = None
+            self.enabled = False
+        except Exception as exc:
+            print(f"warn | buzzer GPIO{pin} unavailable; buzzer disabled: {exc}", flush=True)
+            self.device = None
+            self.enabled = False
+
+    def on(self) -> None:
+        if self.device is not None:
+            self.device.on()
+
+    def off(self) -> None:
+        if self.device is not None:
+            self.device.off()
+
+    def close(self) -> None:
+        try:
+            self.off()
+        finally:
+            if self.device is not None:
+                self.device.close()
+
+
+class GpioStepperLift:
+    def __init__(
+        self,
+        *,
+        step_pin: int,
+        dir_pin: int,
+        en_pin: int,
+        speed_sps: float,
+        step_high_us: int,
+        enabled: bool,
+        mock: bool,
+    ) -> None:
+        self.step_device = None
+        self.dir_device = None
+        self.en_device = None
+        self.lock = threading.Lock()
+        self.speed_sps = max(1.0, float(speed_sps))
+        self.step_high_us = max(1, int(step_high_us))
+        self.enabled = bool(enabled and not mock)
+        if not self.enabled:
+            return
+
+        try:
+            ensure_gpiozero_runtime()
+            from gpiozero import DigitalOutputDevice
+
+            self.step_device = DigitalOutputDevice(step_pin, initial_value=False)
+            self.dir_device = DigitalOutputDevice(dir_pin, initial_value=False)
+            self.en_device = DigitalOutputDevice(en_pin, initial_value=True)
+            print(
+                f"gpio | stepper STEP=GPIO{step_pin} DIR=GPIO{dir_pin} EN=GPIO{en_pin}",
+                flush=True,
+            )
+        except SystemExit as exc:
+            print(f"warn | stepper unavailable; lift disabled: {exc}", flush=True)
+            self.close()
+            self.enabled = False
+        except Exception as exc:
+            print(f"warn | stepper unavailable; lift disabled: {exc}", flush=True)
+            self.close()
+            self.enabled = False
+
+    def status_text(self, steps: int, direction: int) -> str:
+        state = "enabled" if self.enabled else "disabled"
+        return f"stepper | {state} steps={steps} direction={direction} speed={self.speed_sps:.1f} steps/s"
+
+    def run_steps(self, steps: int, direction: int, *, label: str = "lift") -> bool:
+        steps = max(0, int(steps))
+        direction_sign = 1 if direction >= 0 else -1
+        if steps <= 0:
+            print(f"stepper | {label} skipped because steps=0", flush=True)
+            return True
+        if not self.enabled:
+            print(f"stepper | {label} skipped because stepper is disabled", flush=True)
+            return True
+        if self.step_device is None or self.dir_device is None or self.en_device is None:
+            print(f"stepper | {label} skipped because GPIO is unavailable", flush=True)
+            return False
+
+        interval_us = int(1_000_000.0 / self.speed_sps)
+        interval_us = max(interval_us, self.step_high_us + 50)
+
+        print(
+            f"stepper | {label} start steps={steps} direction={direction_sign} speed={self.speed_sps:.1f}",
+            flush=True,
+        )
+        with self.lock:
+            if direction_sign > 0:
+                self.dir_device.on()
+            else:
+                self.dir_device.off()
+            self.en_device.off()
+            time.sleep(STEPPER_DIR_SETUP_S)
+            try:
+                for _ in range(steps):
+                    self.step_device.on()
+                    time.sleep(self.step_high_us / 1_000_000.0)
+                    self.step_device.off()
+                    time.sleep(max((interval_us - self.step_high_us) / 1_000_000.0, 0.0))
+            finally:
+                self.step_device.off()
+                self.en_device.on()
+        print(f"stepper | {label} completed steps={steps} direction={direction_sign}", flush=True)
+        return True
+
+    def run_until_released(self, direction: int, stop_event: threading.Event, *, label: str = "lift hold") -> bool:
+        direction_sign = 1 if direction >= 0 else -1
+        if not self.enabled:
+            print(f"stepper | {label} skipped because stepper is disabled", flush=True)
+            return True
+        if self.step_device is None or self.dir_device is None or self.en_device is None:
+            print(f"stepper | {label} skipped because GPIO is unavailable", flush=True)
+            return False
+
+        interval_us = int(1_000_000.0 / self.speed_sps)
+        interval_us = max(interval_us, self.step_high_us + 50)
+
+        print(
+            f"stepper | {label} start direction={direction_sign} speed={self.speed_sps:.1f}",
+            flush=True,
+        )
+        with self.lock:
+            if direction_sign > 0:
+                self.dir_device.on()
+            else:
+                self.dir_device.off()
+            self.en_device.off()
+            time.sleep(STEPPER_DIR_SETUP_S)
+            try:
+                while not stop_event.is_set():
+                    self.step_device.on()
+                    time.sleep(self.step_high_us / 1_000_000.0)
+                    self.step_device.off()
+                    time.sleep(max((interval_us - self.step_high_us) / 1_000_000.0, 0.0))
+            finally:
+                self.step_device.off()
+                self.en_device.on()
+        print(f"stepper | {label} stopped direction={direction_sign}", flush=True)
+        return True
+
+    def close(self) -> None:
+        for device, off_first in (
+            (self.step_device, True),
+            (self.dir_device, True),
+            (self.en_device, False),
+        ):
+            if device is None:
+                continue
+            try:
+                if off_first:
+                    device.off()
+                else:
+                    device.on()
+            except Exception:
+                pass
+            try:
+                device.close()
+            except Exception:
+                pass
+        self.step_device = None
+        self.dir_device = None
+        self.en_device = None
 
 
 class EspPiControlLink:
@@ -1139,6 +1357,43 @@ def choose_front_avoidance(ir_state: dict[str, bool], brain: SimpleCardinalRealB
     return brain.preferred_direction, args.front_strafe_distance, "front"
 
 
+def wait_for_dynamic_front_clear(
+    ir_bank: GpioIrBank,
+    brain: SimpleCardinalRealBrain,
+    pose_tracker: PoseAccumulator,
+    args,
+    active_sensors: list[str],
+) -> tuple[bool, dict[str, bool]]:
+    hold_s = max(0.0, float(args.front_dynamic_hold))
+    print(
+        f"dynamic | front obstacle {active_sensors}; stop+buzzer hold {hold_s:.1f}s",
+        flush=True,
+    )
+    log_event(args, "front_dynamic_hold", ir=active_sensors, hold_s=hold_s)
+
+    buzzer = getattr(args, "buzzer", None)
+    try:
+        if buzzer is not None:
+            buzzer.on()
+        deadline = time.monotonic() + hold_s
+        while time.monotonic() < deadline:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    finally:
+        if buzzer is not None:
+            buzzer.off()
+
+    ir_state = update_brain_from_pose(brain, pose_tracker, ir_bank, True)
+    still_front = any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS)
+    if still_front:
+        still_active = sorted(name for name in FRONT_WATCH_SENSORS if ir_state.get(name, False))
+        print(f"dynamic | obstacle still present after {hold_s:.1f}s: {still_active}; running static avoidance", flush=True)
+        log_event(args, "front_static_confirmed", ir=still_active)
+    else:
+        print(f"dynamic | front clear after {hold_s:.1f}s; continuing mission", flush=True)
+        log_event(args, "front_dynamic_clear", ir=ir_summary(ir_state))
+    return still_front, ir_state
+
+
 def side_escape_direction(active_sensors: list[str]) -> int:
     if "left" in active_sensors:
         return RIGHT
@@ -1191,56 +1446,6 @@ def execute_segment(
     if logger is not None:
         logger.move(label, angle_deg, distance_m, watch_sensors, done)
     return done
-
-
-def execute_front_trigger_forward_buffer(
-    link: EspPiControlLink | None,
-    pose_tracker: PoseAccumulator,
-    ir_bank: GpioIrBank,
-    brain: SimpleCardinalRealBrain,
-    args,
-    mission: MissionMemory,
-) -> dict:
-    target_m = args.front_trigger_forward_buffer_distance
-    start_forward_m = mission.forward_m
-    last_done = {"result": "none", "forwardCm": 0.0, "strafeCm": 0.0, "headingDeg": args.heading}
-
-    for attempt in range(args.front_trigger_forward_buffer_attempts):
-        completed_m = max(0.0, mission.forward_m - start_forward_m)
-        remaining_m = target_m - completed_m
-        if remaining_m <= args.front_trigger_forward_buffer_tolerance:
-            return last_done
-
-        label = "front sensitivity forward buffer"
-        if attempt:
-            label = f"front sensitivity forward buffer retry {attempt + 1}"
-        last_done = execute_segment(
-            link,
-            pose_tracker,
-            ir_bank,
-            brain,
-            args,
-            label,
-            0.0,
-            remaining_m,
-            set(),
-            mission,
-            move_timeout_s=args.front_trigger_forward_buffer_timeout,
-            timeout_returns_done=True,
-        )
-        if last_done.get("result") == "ir_stop":
-            return last_done
-        if last_done.get("result") == "timeout_stop":
-            return last_done
-
-    completed_m = max(0.0, mission.forward_m - start_forward_m)
-    if completed_m + args.front_trigger_forward_buffer_tolerance < target_m:
-        print(
-            f"warn | front sensitivity buffer reported {completed_m * 100.0:.1f}cm "
-            f"of requested {target_m * 100.0:.1f}cm",
-            flush=True,
-        )
-    return last_done
 
 
 def execute_front_search_strafe(
@@ -1626,16 +1831,10 @@ def execute_front_avoidance(
     corner_sensor = front_corner_sensor_after_strafe(direction)
     side_sensor = side_sensor_after_front_avoidance(direction)
     print(
-        f"avoid | {reason}: forward buffer {args.front_trigger_forward_buffer_distance * 100.0:.1f}cm, "
-        f"then strafe {direction_name(direction)} until {corner_sensor} rising/falling, "
+        f"avoid | {reason}: strafe {direction_name(direction)} until {corner_sensor} rising/falling, "
         f"then follow {side_sensor} falling edge and advance {args.front_advance_distance * 100.0:.1f}cm",
         flush=True,
     )
-
-    if any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS):
-        done = execute_front_trigger_forward_buffer(link, pose_tracker, ir_bank, brain, args, mission)
-        if done.get("result") == "ir_stop":
-            return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
 
     done, direction, corner_sensor = execute_front_search_strafe(
         link,
@@ -1726,6 +1925,27 @@ def handle_ir_stop(
         ir_state[name] = True
 
     if any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS):
+        still_front, ir_state = wait_for_dynamic_front_clear(
+            ir_bank,
+            brain,
+            pose_tracker,
+            args,
+            sorted(name for name in FRONT_WATCH_SENSORS if ir_state.get(name, False)),
+        )
+        if not still_front:
+            side_hits = sorted(name for name in SIDE_WATCH_SENSORS if ir_state.get(name, False))
+            if side_hits:
+                done = execute_side_escape(link, pose_tracker, ir_bank, brain, args, side_hits, action_budget, mission)
+                if done.get("result") == "ir_stop":
+                    return handle_ir_stop(link, pose_tracker, ir_bank, brain, args, done.get("ir", []), action_budget, mission)
+                return done
+            return {
+                "result": "front_dynamic_clear",
+                "ir": [],
+                "forwardCm": 0.0,
+                "strafeCm": 0.0,
+                "headingDeg": args.heading,
+            }
         return execute_front_avoidance(link, pose_tracker, ir_bank, brain, args, ir_state, action_budget, mission)
     if any(ir_state.get(name, False) for name in SIDE_WATCH_SENSORS):
         done = execute_side_escape(link, pose_tracker, ir_bank, brain, args, active_sensors, action_budget, mission)
@@ -1774,6 +1994,31 @@ def execute_goal_correction(
                 mission,
             )
     raise RuntimeError("Could not correct back to the 120cm goal mark")
+
+
+def run_goal_lift(args) -> None:
+    action = args.goal_stepper_action
+    if not args.lift_on_goal:
+        action = "none"
+    if action == "none":
+        print("stepper | goal action none", flush=True)
+        return
+
+    stepper = getattr(args, "stepper_lift", None)
+    if stepper is None:
+        print("stepper | goal lift unavailable", flush=True)
+        return
+
+    steps = int(args.lift_steps)
+    if args.lift_direction is None:
+        direction = STEPPER_UP_DIR if action == "up" else STEPPER_DOWN_DIR
+    else:
+        direction = int(args.lift_direction)
+    label = f"goal stepper {action}"
+    print(stepper.status_text(steps, direction), flush=True)
+    log_event(args, "goal_stepper_start", action=action, steps=steps, direction=direction)
+    ok = stepper.run_steps(steps, direction, label=label)
+    log_event(args, "goal_stepper_done", action=action, steps=steps, direction=direction, ok=ok)
 
 
 def run_segment_mission(
@@ -1842,6 +2087,7 @@ def run_segment_mission(
                 if link is not None:
                     link.command_ack("STOP")
                 print("Goal reached; ESP stopped.", flush=True)
+                run_goal_lift(args)
                 return
 
         move_distance = max(0.0, remaining)
@@ -2023,6 +2269,11 @@ def run_ir_train_mode(
             for name in front_hits:
                 ir_state[name] = True
             print(f"train | front sequence from {front_hits}", flush=True)
+            still_front, ir_state = wait_for_dynamic_front_clear(ir_bank, brain, pose_tracker, args, front_hits)
+            if not still_front:
+                print("train | dynamic obstacle cleared; no avoidance needed", flush=True)
+                tracker = IrEdgeTracker()
+                continue
             done = execute_front_avoidance(link, pose_tracker, ir_bank, brain, args, ir_state, action_budget, mission)
             print(f"train | sequence done result={done.get('result')}", flush=True)
             tracker = IrEdgeTracker()
@@ -2115,6 +2366,14 @@ Logs:
     parser.add_argument("--active-low", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pull-up", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--manual-watch-ir", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--buzzer", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--buzzer-pin", type=int, default=DEFAULT_BUZZER_PIN, help=f"Buzzer BCM GPIO pin; default {DEFAULT_BUZZER_PIN}.")
+    parser.add_argument("--buzzer-active-high", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lift-on-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--goal-stepper-action", choices=("up", "down", "none"), default="up")
+    parser.add_argument("--lift-steps", type=int, default=STEPPER_DEFAULT_STEPS)
+    parser.add_argument("--lift-direction", type=int, choices=(STEPPER_DOWN_DIR, STEPPER_UP_DIR), default=None, help="Low-level override: 1 is up, -1 is down.")
+    parser.add_argument("--stepper-speed-sps", type=float, default=STEPPER_SPEED_SPS)
     parser.add_argument("--prompt-goal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-dir", default="run_logs")
     parser.add_argument("--log", action=argparse.BooleanOptionalAction, default=True)
@@ -2143,10 +2402,7 @@ Logs:
     parser.add_argument("--front-advance-distance", type=float, default=0.30)
     parser.add_argument("--front-strafe-search-distance", type=float, default=1.20)
     parser.add_argument("--front-corner-buffer-distance", type=float, default=0.05)
-    parser.add_argument("--front-trigger-forward-buffer-distance", type=float, default=0.10)
-    parser.add_argument("--front-trigger-forward-buffer-timeout", type=float, default=0.75)
-    parser.add_argument("--front-trigger-forward-buffer-tolerance", type=float, default=0.005)
-    parser.add_argument("--front-trigger-forward-buffer-attempts", type=int, default=3)
+    parser.add_argument("--front-dynamic-hold", type=float, default=3.0)
     parser.add_argument("--front-strafe-search-timeout", type=float, default=8.0)
     parser.add_argument("--front-corner-buffer-timeout", type=float, default=1.25)
     parser.add_argument("--front-advance-timeout", type=float, default=4.0)
@@ -2154,7 +2410,7 @@ Logs:
     parser.add_argument("--side-follow-dry-distance", type=float, default=0.30)
     parser.add_argument("--side-follow-watch-front", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--side-escape-distance", type=float, default=0.10)
-    parser.add_argument("--side-escape-forward-distance", type=float, default=0.30)
+    parser.add_argument("--side-escape-forward-distance", type=float, default=0.20)
     parser.add_argument("--max-recenter-attempts", type=int, default=8)
     parser.add_argument("--max-goal-correction-attempts", type=int, default=4)
     parser.add_argument("--max-avoidance-actions", type=int, default=24)
@@ -2180,6 +2436,10 @@ Logs:
         parser.error("--position-step must be greater than zero")
     if args.min_position_step <= 0.0:
         parser.error("--min-position-step must be greater than zero")
+    if args.lift_steps < 0:
+        parser.error("--lift-steps cannot be negative")
+    if args.stepper_speed_sps <= 0.0:
+        parser.error("--stepper-speed-sps must be greater than zero")
     if args.front_strafe_distance <= 0.0:
         parser.error("--front-strafe-distance must be greater than zero")
     if args.front_corner_strafe_distance <= 0.0:
@@ -2190,14 +2450,8 @@ Logs:
         parser.error("--front-strafe-search-distance must be greater than zero")
     if args.front_corner_buffer_distance <= 0.0:
         parser.error("--front-corner-buffer-distance must be greater than zero")
-    if args.front_trigger_forward_buffer_distance <= 0.0:
-        parser.error("--front-trigger-forward-buffer-distance must be greater than zero")
-    if args.front_trigger_forward_buffer_timeout <= 0.0:
-        parser.error("--front-trigger-forward-buffer-timeout must be greater than zero")
-    if args.front_trigger_forward_buffer_tolerance < 0.0:
-        parser.error("--front-trigger-forward-buffer-tolerance cannot be negative")
-    if args.front_trigger_forward_buffer_attempts <= 0:
-        parser.error("--front-trigger-forward-buffer-attempts must be greater than zero")
+    if args.front_dynamic_hold < 0.0:
+        parser.error("--front-dynamic-hold cannot be negative")
     if args.front_strafe_search_timeout <= 0.0:
         parser.error("--front-strafe-search-timeout must be greater than zero")
     if args.front_corner_buffer_timeout <= 0.0:
@@ -2246,11 +2500,26 @@ def prompt_goal_if_needed(args) -> None:
         return
     raw = input(f"Goal distance cm [{args.goal_distance * 100.0:.1f}]: ").strip()
     if not raw:
-        return
-    value_cm = float(raw)
-    if value_cm <= 0.0:
-        raise ValueError("Goal distance must be greater than zero")
-    args.goal_distance = value_cm / 100.0
+        pass
+    else:
+        value_cm = float(raw)
+        if value_cm <= 0.0:
+            raise ValueError("Goal distance must be greater than zero")
+        args.goal_distance = value_cm / 100.0
+
+    raw = input(f"End stepper action up/down/none [{args.goal_stepper_action}]: ").strip().lower()
+    if raw:
+        if raw not in {"up", "down", "none"}:
+            raise ValueError("End stepper action must be up, down, or none")
+        args.goal_stepper_action = raw
+
+    if args.goal_stepper_action != "none":
+        raw = input(f"End stepper steps [{args.lift_steps}]: ").strip()
+        if raw:
+            steps = int(raw)
+            if steps < 0:
+                raise ValueError("End stepper steps cannot be negative")
+            args.lift_steps = steps
 
 
 def main() -> None:
@@ -2264,6 +2533,21 @@ def main() -> None:
         pull_up=args.pull_up,
         mock=args.mock_ir or args.dry_run,
         logic=args.ir_logic,
+    )
+    args.buzzer = GpioBuzzer(
+        pin=args.buzzer_pin,
+        active_high=args.buzzer_active_high,
+        enabled=args.buzzer,
+        mock=args.dry_run,
+    )
+    args.stepper_lift = GpioStepperLift(
+        step_pin=STEPPER_STEP_PIN,
+        dir_pin=STEPPER_DIR_PIN,
+        en_pin=STEPPER_EN_PIN,
+        speed_sps=args.stepper_speed_sps,
+        step_high_us=STEPPER_STEP_HIGH_US,
+        enabled=args.mode == "mission" and args.lift_on_goal,
+        mock=args.dry_run,
     )
     brain = SimpleCardinalRealBrain(args)
     link = None
@@ -2322,6 +2606,8 @@ def main() -> None:
             except Exception:
                 pass
             link.close()
+        args.stepper_lift.close()
+        args.buzzer.close()
         ir_bank.close()
         args.logger.close()
 

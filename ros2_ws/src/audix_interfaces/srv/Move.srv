@@ -1,0 +1,13 @@
+float32 angle_deg
+float32 distance_m
+float32 heading_deg
+float32 timeout_s
+bool wait_for_done
+---
+bool ok
+string result
+string message
+float32 forward_cm
+float32 strafe_cm
+float32 heading_deg
+string raw_json
