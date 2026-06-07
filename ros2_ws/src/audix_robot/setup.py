@@ -9,7 +9,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}/launch", ["launch/audix_bridge.launch.py"]),
+        (
+            f"share/{package_name}/launch",
+            ["launch/audix_bridge.launch.py", "launch/audix_main.launch.py"],
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -20,6 +23,9 @@ setup(
     entry_points={
         "console_scripts": [
             "esp_uart_bridge_node = audix_robot.esp_uart_bridge_node:main",
+            "gpio_hardware_node = audix_robot.gpio_hardware_node:main",
+            "robot_manager_node = audix_robot.robot_manager_node:main",
+            "web_dashboard_node = audix_robot.web_dashboard_node:main",
             "terminal_move_node = audix_robot.terminal_move_node:main",
             "terminal_teleop_node = audix_robot.terminal_teleop_node:main",
         ],

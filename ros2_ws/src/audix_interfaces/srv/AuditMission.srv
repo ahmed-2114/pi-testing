@@ -1,0 +1,6 @@
+int32[] shelves
+bool level_1
+bool level_2
+---
+bool accepted
+string message

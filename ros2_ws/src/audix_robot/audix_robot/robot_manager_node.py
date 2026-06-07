@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+"""Safe high-level command gate and mission/avoidance manager for Audix."""
+
+from __future__ import annotations
+
+import math
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+import rclpy
+from audix_interfaces.msg import EspTelemetry, IrState
+from audix_interfaces.srv import AuditMission, DirectionCommand, LiftMoveSteps, Move, RotateCommand, SetRobotMode
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import String
+from std_srvs.srv import SetBool, Trigger
+
+
+LEFT = -1
+RIGHT = 1
+IR_SENSOR_ORDER = ("front_left", "front", "front_right", "right", "back", "left")
+FRONT_WATCH_SENSORS = {"front", "front_left", "front_right"}
+SIDE_WATCH_SENSORS = {"left", "right"}
+ALL_WATCH_SENSORS = FRONT_WATCH_SENSORS | SIDE_WATCH_SENSORS
+
+DIRECTION_ANGLES_DEG = {
+    "F": 0.0,
+    "FR": -45.0,
+    "R": -90.0,
+    "BR": -135.0,
+    "B": 180.0,
+    "BL": 135.0,
+    "L": 90.0,
+    "FL": 45.0,
+}
+
+
+@dataclass
+class MoveDone:
+    result: str = "none"
+    message: str = ""
+    forward_cm: float = 0.0
+    strafe_cm: float = 0.0
+    heading_deg: float = 0.0
+    ir: list[str] | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "result": self.result,
+            "message": self.message,
+            "forwardCm": self.forward_cm,
+            "strafeCm": self.strafe_cm,
+            "headingDeg": self.heading_deg,
+            "ir": self.ir or [],
+        }
+
+
+@dataclass
+class MissionArgs:
+    goal_distance: float = 1.20
+    goal_tolerance: float = 0.05
+    position_step: float = 0.05
+    min_position_step: float = 0.005
+    heading: float = 0.0
+    status_period: float = 0.5
+    telemetry_timeout: float = 0.5
+    move_timeout: float = 180.0
+    front_dynamic_hold: float = 3.0
+    front_strafe_distance: float = 0.20
+    front_corner_strafe_distance: float = 0.15
+    front_advance_distance: float = 0.30
+    front_strafe_search_distance: float = 1.20
+    front_corner_buffer_distance: float = 0.05
+    front_strafe_search_timeout: float = 8.0
+    front_corner_buffer_timeout: float = 1.25
+    front_advance_timeout: float = 4.0
+    side_follow_search_distance: float = 3.00
+    side_follow_dry_distance: float = 0.30
+    side_follow_watch_front: bool = False
+    side_escape_distance: float = 0.10
+    side_escape_forward_distance: float = 0.20
+    rejoin_tolerance: float = 0.02
+    max_recenter_attempts: int = 8
+    max_goal_correction_attempts: int = 4
+    max_avoidance_actions: int = 24
+
+
+def opposite_direction(direction: int) -> int:
+    return LEFT if direction == RIGHT else RIGHT
+
+
+def direction_to_angle(direction: int) -> float:
+    return 90.0 if direction == LEFT else -90.0
+
+
+def direction_name(direction: int) -> str:
+    return "left" if direction == LEFT else "right"
+
+
+def side_sensor_for_direction(direction: int) -> str:
+    return "left" if direction == LEFT else "right"
+
+
+def front_corner_sensor_after_strafe(direction: int) -> str:
+    return "front_right" if direction == LEFT else "front_left"
+
+
+def side_sensor_after_front_avoidance(direction: int) -> str:
+    return side_sensor_for_direction(opposite_direction(direction))
+
+
+def side_escape_direction(active_sensors: list[str]) -> int:
+    return RIGHT if "left" in active_sensors else LEFT
+
+
+class PoseAccumulator:
+    def __init__(self) -> None:
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+
+    def pose(self) -> tuple[float, float, float]:
+        return self.x, self.y, self.yaw
+
+    def set_from_telemetry(self, telemetry: EspTelemetry) -> tuple[float, float, float]:
+        self.x = -float(telemetry.forward_cm) / 100.0
+        self.y = -float(telemetry.strafe_cm) / 100.0
+        self.yaw = math.radians(float(telemetry.yaw_deg))
+        return self.pose()
+
+
+@dataclass
+class MissionMemory:
+    forward_m: float = 0.0
+    lateral_m: float = 0.0
+
+    def record_completed_move(self, angle_deg: float, distance_m: float, done: dict) -> None:
+        if done.get("result") == "ir_stop":
+            return
+        angle_rad = math.radians(angle_deg)
+        command_forward_m = math.cos(angle_rad) * distance_m
+        command_lateral_m = math.sin(angle_rad) * distance_m
+        if abs(command_forward_m) >= abs(command_lateral_m):
+            reported_forward_m = 0.01 * float(done.get("forwardCm", command_forward_m * 100.0))
+            if abs(reported_forward_m) < 1e-6:
+                reported_forward_m = command_forward_m
+            self.forward_m = max(0.0, self.forward_m + reported_forward_m)
+        else:
+            self.lateral_m += command_lateral_m
+
+    def sync_from_pose(self, pose_tracker: PoseAccumulator) -> None:
+        self.forward_m = max(0.0, -pose_tracker.x)
+        self.lateral_m = -pose_tracker.y
+
+    def snap_center_if_close(self, tolerance_m: float) -> None:
+        if abs(self.lateral_m) <= tolerance_m:
+            self.lateral_m = 0.0
+
+
+class RobotManager(Node):
+    def __init__(self) -> None:
+        super().__init__("robot_manager")
+        self.mode = "manual"
+        self.mode_lock = threading.Lock()
+        self.motion_lock = threading.Lock()
+        self.latest_ir = {name: False for name in IR_SENSOR_ORDER}
+        self.latest_telemetry: EspTelemetry | None = None
+        self.pose = PoseAccumulator()
+        self.last_event = "ready"
+        self.manual_buzzer_until = 0.0
+        self.manual_stop_last_s = 0.0
+        self.mission_running = False
+        self.cancel_mission = threading.Event()
+
+        self.args = MissionArgs(
+            goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
+            front_dynamic_hold=float(self.declare_parameter("front_dynamic_hold_s", 3.0).value),
+        )
+        self.allow_placeholder_audit = bool(self.declare_parameter("allow_placeholder_audit", False).value)
+        self.buzzer_hold_s = float(self.declare_parameter("manual_buzzer_hold_s", 1.5).value)
+        self.lift_steps = int(self.declare_parameter("audit_lift_steps", 500).value)
+        self.lift_speed_sps = float(self.declare_parameter("lift_speed_sps", 275.0).value)
+
+        self.move_client = self.create_client(Move, "move")
+        self.stop_client = self.create_client(Trigger, "esp/stop")
+        self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer")
+        self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps")
+
+        self.create_subscription(IrState, "ir/state", self._on_ir, 10)
+        self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10)
+        self.event_pub = self.create_publisher(String, "mission/event", 20)
+
+        self.create_service(SetRobotMode, "manager/set_mode", self._handle_set_mode)
+        self.create_service(DirectionCommand, "manager/direction_move", self._handle_direction_move)
+        self.create_service(RotateCommand, "manager/rotate", self._handle_rotate)
+        self.create_service(AuditMission, "manager/start_audit", self._handle_start_audit)
+        self.create_service(Trigger, "manager/stop", self._handle_manager_stop)
+        self.create_timer(0.05, self._manual_safety_tick)
+        self.get_logger().info("Robot manager ready")
+
+    def _on_ir(self, msg: IrState) -> None:
+        self.latest_ir = {
+            "front_left": bool(msg.front_left),
+            "front": bool(msg.front),
+            "front_right": bool(msg.front_right),
+            "right": bool(msg.right),
+            "back": bool(msg.back),
+            "left": bool(msg.left),
+        }
+
+    def _on_telemetry(self, msg: EspTelemetry) -> None:
+        self.latest_telemetry = msg
+        self.pose.set_from_telemetry(msg)
+        self.args.heading = float(msg.yaw_deg)
+
+    def _publish_event(self, text: str) -> None:
+        self.last_event = text
+        msg = String()
+        msg.data = text
+        self.event_pub.publish(msg)
+        self.get_logger().info(text)
+
+    def _active_ir(self, sensors: set[str] | None = None) -> list[str]:
+        names = sensors if sensors is not None else set(IR_SENSOR_ORDER)
+        return sorted(name for name in names if self.latest_ir.get(name, False))
+
+    def _call_sync(self, client, request, timeout_s: float):
+        if not client.wait_for_service(timeout_sec=max(0.1, min(timeout_s, 1.0))):
+            raise RuntimeError(f"service unavailable: {client.srv_name}")
+        event = threading.Event()
+        holder = {}
+        future = client.call_async(request)
+        future.add_done_callback(lambda done: (holder.setdefault("future", done), event.set()))
+        if not event.wait(timeout_s):
+            raise TimeoutError(f"timed out waiting for {client.srv_name}")
+        return holder["future"].result()
+
+    def _set_buzzer(self, enabled: bool) -> None:
+        try:
+            req = SetBool.Request()
+            req.data = bool(enabled)
+            self._call_sync(self.buzzer_client, req, 1.0)
+        except Exception as exc:
+            self.get_logger().warning(f"buzzer request failed: {exc}")
+
+    def _stop_robot(self) -> None:
+        try:
+            self._call_sync(self.stop_client, Trigger.Request(), 2.0)
+        except Exception as exc:
+            self.get_logger().warning(f"STOP request failed: {exc}")
+
+    def _manual_safety_tick(self) -> None:
+        with self.mode_lock:
+            mode = self.mode
+        if mode != "manual":
+            return
+        active = self._active_ir()
+        now = time.monotonic()
+        if active:
+            if now - self.manual_stop_last_s >= 0.5:
+                self._stop_robot()
+                self.manual_stop_last_s = now
+                self._publish_event(f"manual obstacle stop: {active}")
+            self.manual_buzzer_until = now + self.buzzer_hold_s
+            self._set_buzzer(True)
+        elif self.manual_buzzer_until and now >= self.manual_buzzer_until:
+            self.manual_buzzer_until = 0.0
+            self._set_buzzer(False)
+
+    def _send_move_future(self, angle_deg: float, distance_m: float, heading_deg: float, timeout_s: float):
+        request = Move.Request()
+        request.angle_deg = float(angle_deg)
+        request.distance_m = max(0.0, float(distance_m))
+        request.heading_deg = float(heading_deg)
+        request.timeout_s = max(0.05, float(timeout_s))
+        request.wait_for_done = True
+        return self.move_client.call_async(request)
+
+    def _move_done_from_response(self, response: Move.Response, result_override: str | None = None, ir: list[str] | None = None) -> dict:
+        result = result_override or str(response.result)
+        return MoveDone(
+            result=result,
+            message=str(response.message),
+            forward_cm=float(response.forward_cm),
+            strafe_cm=float(response.strafe_cm),
+            heading_deg=float(response.heading_deg),
+            ir=ir or [],
+        ).as_dict()
+
+    def _current_heading_deg(self) -> float:
+        if self.latest_telemetry is not None:
+            return float(self.latest_telemetry.yaw_deg)
+        return math.degrees(self.pose.yaw)
+
+    def _execute_move_watch(
+        self,
+        angle_deg: float,
+        distance_m: float,
+        watch_sensors: set[str],
+        timeout_s: float,
+        *,
+        label: str,
+        stop_predicate: Callable[[], tuple[str, list[str]] | None] | None = None,
+    ) -> dict:
+        self._publish_event(f"move {label}: angle={angle_deg:.1f} dist_cm={distance_m * 100.0:.1f}")
+        future = self._send_move_future(angle_deg, distance_m, self.args.heading, timeout_s)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if future.done():
+                response = future.result()
+                return self._move_done_from_response(response)
+
+            if stop_predicate is not None:
+                stop = stop_predicate()
+                if stop is not None:
+                    result, active = stop
+                    self._stop_robot()
+                    response = self._wait_future_response(future, 1.5)
+                    if response is not None:
+                        return self._move_done_from_response(response, result_override=result, ir=active)
+                    return MoveDone(result=result, heading_deg=self._current_heading_deg(), ir=active).as_dict()
+
+            active = self._active_ir(watch_sensors)
+            if active:
+                self._publish_event(f"ir_stop active={active}")
+                self._stop_robot()
+                response = self._wait_future_response(future, 1.5)
+                if response is not None:
+                    return self._move_done_from_response(response, result_override="ir_stop", ir=active)
+                return MoveDone(result="ir_stop", heading_deg=self._current_heading_deg(), ir=active).as_dict()
+
+            time.sleep(0.02)
+
+        self._stop_robot()
+        response = self._wait_future_response(future, 1.5)
+        if response is not None:
+            return self._move_done_from_response(response, result_override="timeout_stop")
+        raise TimeoutError(f"timed out waiting for move {label}")
+
+    @staticmethod
+    def _wait_future_response(future, timeout_s: float):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if future.done():
+                return future.result()
+            time.sleep(0.02)
+        return None
+
+    def _execute_segment(
+        self,
+        angle_deg: float,
+        distance_m: float,
+        watch_sensors: set[str],
+        mission: MissionMemory | None,
+        *,
+        label: str,
+        move_timeout_s: float | None = None,
+        timeout_returns_done: bool = False,
+    ) -> dict:
+        timeout_s = move_timeout_s if move_timeout_s is not None else self.args.move_timeout
+        done = self._execute_move_watch(angle_deg, max(0.0, distance_m), watch_sensors, timeout_s, label=label)
+        if done.get("result") == "timeout_stop" and not timeout_returns_done:
+            raise TimeoutError(f"Timed out during {label}")
+        if mission is not None:
+            if done.get("result") == "ir_stop":
+                mission.sync_from_pose(self.pose)
+            else:
+                mission.record_completed_move(angle_deg, distance_m, done)
+                mission.sync_from_pose(self.pose)
+                mission.snap_center_if_close(self.args.rejoin_tolerance)
+        return done
+
+    def _wait_for_dynamic_front_clear(self, active_sensors: list[str]) -> tuple[bool, dict[str, bool]]:
+        hold_s = max(0.0, self.args.front_dynamic_hold)
+        self._publish_event(f"dynamic front hold {hold_s:.1f}s active={active_sensors}")
+        self._set_buzzer(True)
+        try:
+            time.sleep(hold_s)
+        finally:
+            self._set_buzzer(False)
+        ir_state = dict(self.latest_ir)
+        still_front = any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS)
+        return still_front, ir_state
+
+    def _choose_front_avoidance(self, ir_state: dict[str, bool]) -> tuple[int, str]:
+        front = bool(ir_state.get("front", False))
+        front_left = bool(ir_state.get("front_left", False))
+        front_right = bool(ir_state.get("front_right", False))
+        if front:
+            if front_left and not front_right:
+                return RIGHT, "front+front_left"
+            if front_right and not front_left:
+                return LEFT, "front+front_right"
+            return RIGHT, "front"
+        if front_left:
+            return RIGHT, "front_left"
+        if front_right:
+            return LEFT, "front_right"
+        return RIGHT, "front"
+
+    def _execute_front_search_strafe(self, direction: int, mission: MissionMemory) -> tuple[dict, int, str]:
+        for _attempt in range(2):
+            corner_sensor = front_corner_sensor_after_strafe(direction)
+            side_block_sensor = side_sensor_for_direction(direction)
+            watch = {corner_sensor, side_block_sensor}
+            done = self._execute_segment(
+                direction_to_angle(direction),
+                self.args.front_strafe_search_distance,
+                watch,
+                mission,
+                label=f"front search strafe {direction_name(direction)}",
+                move_timeout_s=self.args.front_strafe_search_timeout,
+                timeout_returns_done=True,
+            )
+            active = set(done.get("ir", []))
+            if done.get("result") == "ir_stop" and side_block_sensor in active:
+                direction = opposite_direction(direction)
+                continue
+            return done, direction, corner_sensor
+        raise RuntimeError("both strafe directions blocked during front avoidance")
+
+    def _execute_strafe_until_corner_falling(self, direction: int, corner_sensor: str, mission: MissionMemory) -> dict:
+        previous_active = bool(self.latest_ir.get(corner_sensor, False))
+
+        def stop_predicate():
+            side_block_sensor = side_sensor_for_direction(direction)
+            if self.latest_ir.get(side_block_sensor, False):
+                return "ir_stop", [side_block_sensor]
+            nonlocal previous_active
+            active = bool(self.latest_ir.get(corner_sensor, False))
+            if previous_active and not active:
+                return "corner_falling", [corner_sensor]
+            previous_active = active
+            return None
+
+        done = self._execute_move_watch(
+            direction_to_angle(direction),
+            self.args.front_strafe_search_distance,
+            set(),
+            self.args.front_strafe_search_timeout,
+            label=f"strafe until {corner_sensor} falling",
+            stop_predicate=stop_predicate,
+        )
+        mission.sync_from_pose(self.pose)
+        return done
+
+    def _execute_forward_until_side_falling(self, side_sensor: str, mission: MissionMemory) -> dict:
+        seen_active = bool(self.latest_ir.get(side_sensor, False))
+        previous_active = seen_active
+
+        def stop_predicate():
+            nonlocal seen_active, previous_active
+            front_watch = FRONT_WATCH_SENSORS if self.args.side_follow_watch_front else set()
+            front_hits = self._active_ir(front_watch)
+            if front_hits:
+                return "ir_stop", front_hits
+            active = bool(self.latest_ir.get(side_sensor, False))
+            if active and not seen_active:
+                seen_active = True
+            if seen_active and previous_active and not active:
+                return "side_falling", [side_sensor]
+            previous_active = active
+            return None
+
+        done = self._execute_move_watch(
+            0.0,
+            self.args.side_follow_search_distance,
+            set(),
+            self.args.move_timeout,
+            label=f"forward until {side_sensor} falling",
+            stop_predicate=stop_predicate,
+        )
+        mission.sync_from_pose(self.pose)
+        return done
+
+    def _execute_side_escape(self, active_sensors: list[str], action_budget: list[int], mission: MissionMemory) -> dict:
+        action_budget[0] -= 1
+        if action_budget[0] < 0:
+            raise RuntimeError("too many avoidance actions")
+        direction = side_escape_direction(active_sensors)
+        done = self._execute_segment(
+            direction_to_angle(direction),
+            self.args.side_escape_distance,
+            set(),
+            mission,
+            label="side escape strafe",
+        )
+        if done.get("result") == "ir_stop":
+            return done
+        return self._execute_segment(
+            0.0,
+            self.args.side_escape_forward_distance,
+            ALL_WATCH_SENSORS,
+            mission,
+            label="side escape forward",
+        )
+
+    def _execute_recenter(self, action_budget: list[int], mission: MissionMemory) -> dict:
+        last_done = MoveDone(heading_deg=self._current_heading_deg()).as_dict()
+        for _ in range(self.args.max_recenter_attempts):
+            offset = mission.lateral_m
+            if abs(offset) <= self.args.rejoin_tolerance:
+                mission.lateral_m = 0.0
+                return last_done
+            direction = LEFT if offset > 0.0 else RIGHT
+            done = self._execute_segment(
+                direction_to_angle(direction),
+                abs(offset),
+                {side_sensor_for_direction(direction)},
+                mission,
+                label="return to center",
+            )
+            last_done = done
+            if done.get("result") == "ir_stop":
+                last_done = self._execute_side_escape(done.get("ir", []), action_budget, mission)
+        raise RuntimeError("could not return to center")
+
+    def _execute_front_avoidance(self, ir_state: dict[str, bool], action_budget: list[int], mission: MissionMemory) -> dict:
+        action_budget[0] -= 1
+        if action_budget[0] < 0:
+            raise RuntimeError("too many avoidance actions")
+        direction, reason = self._choose_front_avoidance(ir_state)
+        if ir_state.get(side_sensor_for_direction(direction), False):
+            direction = opposite_direction(direction)
+        self._publish_event(f"front avoidance {reason}: strafe {direction_name(direction)}")
+        done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
+        side_sensor = side_sensor_after_front_avoidance(direction)
+        if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
+            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        done = self._execute_strafe_until_corner_falling(direction, corner_sensor, mission)
+        if done.get("result") == "ir_stop":
+            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        done = self._execute_forward_until_side_falling(side_sensor, mission)
+        if done.get("result") == "ir_stop":
+            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        done = self._execute_segment(
+            0.0,
+            self.args.front_advance_distance,
+            ALL_WATCH_SENSORS,
+            mission,
+            label="side clear forward buffer",
+            move_timeout_s=self.args.front_advance_timeout,
+            timeout_returns_done=True,
+        )
+        if done.get("result") == "ir_stop":
+            return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        return self._execute_recenter(action_budget, mission)
+
+    def _handle_ir_stop(self, active_sensors: list[str], action_budget: list[int], mission: MissionMemory) -> dict:
+        ir_state = {name: False for name in IR_SENSOR_ORDER}
+        for name in active_sensors:
+            ir_state[name] = True
+        if any(ir_state.get(name, False) for name in FRONT_WATCH_SENSORS):
+            still_front, ir_state = self._wait_for_dynamic_front_clear(
+                sorted(name for name in FRONT_WATCH_SENSORS if ir_state.get(name, False))
+            )
+            if not still_front:
+                side_hits = sorted(name for name in SIDE_WATCH_SENSORS if ir_state.get(name, False))
+                if side_hits:
+                    done = self._execute_side_escape(side_hits, action_budget, mission)
+                    if done.get("result") == "ir_stop":
+                        return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+                    return done
+                return MoveDone(result="front_dynamic_clear", heading_deg=self._current_heading_deg()).as_dict()
+            return self._execute_front_avoidance(ir_state, action_budget, mission)
+        if any(ir_state.get(name, False) for name in SIDE_WATCH_SENSORS):
+            done = self._execute_side_escape(active_sensors, action_budget, mission)
+            if done.get("result") == "ir_stop":
+                return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+            return done
+        return MoveDone(result="ignored_ir", heading_deg=self._current_heading_deg(), ir=active_sensors).as_dict()
+
+    def _mission_direction_move(self, direction: str, distance_cm: float, timeout_s: float) -> dict:
+        angle = DIRECTION_ANGLES_DEG[direction]
+        mission = MissionMemory()
+        action_budget = [self.args.max_avoidance_actions]
+        done = self._execute_segment(
+            angle,
+            max(0.0, distance_cm) / 100.0,
+            ALL_WATCH_SENSORS,
+            mission,
+            label=f"mission {direction}",
+            move_timeout_s=timeout_s if timeout_s > 0.0 else self.args.move_timeout,
+            timeout_returns_done=True,
+        )
+        if done.get("result") == "ir_stop":
+            done = self._handle_ir_stop(done.get("ir", []), action_budget, mission)
+        return done
+
+    def _handle_set_mode(self, request: SetRobotMode.Request, response: SetRobotMode.Response) -> SetRobotMode.Response:
+        mode = request.mode.strip().lower()
+        if mode not in {"manual", "mission", "idle"}:
+            response.ok = False
+            response.message = "mode must be manual, mission, or idle"
+            response.active_mode = self.mode
+            return response
+        with self.mode_lock:
+            self.mode = mode
+        if mode != "mission":
+            self.cancel_mission.set()
+        response.ok = True
+        response.message = f"mode set to {mode}"
+        response.active_mode = mode
+        self._publish_event(response.message)
+        return response
+
+    def _handle_direction_move(
+        self,
+        request: DirectionCommand.Request,
+        response: DirectionCommand.Response,
+    ) -> DirectionCommand.Response:
+        direction = request.direction.strip().upper()
+        if direction not in DIRECTION_ANGLES_DEG:
+            response.ok = False
+            response.result = "invalid_direction"
+            response.message = "direction must be F, B, R, L, FR, FL, BR, or BL"
+            return response
+
+        with self.motion_lock:
+            with self.mode_lock:
+                mode = self.mode
+            if mode == "manual":
+                active = self._active_ir()
+                if active:
+                    self._stop_robot()
+                    self._set_buzzer(True)
+                    self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+                    response.ok = False
+                    response.result = "manual_ir_stop"
+                    response.message = f"manual obstacle stop: {active}"
+                    return response
+                angle = DIRECTION_ANGLES_DEG[direction]
+                done = self._execute_segment(
+                    angle,
+                    max(0.0, float(request.distance_cm)) / 100.0,
+                    set(),
+                    None,
+                    label=f"manual {direction}",
+                    move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
+                    timeout_returns_done=True,
+                )
+            else:
+                done = self._mission_direction_move(direction, float(request.distance_cm), float(request.timeout_s))
+
+        response.ok = done.get("result") in {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "none"}
+        response.result = str(done.get("result", ""))
+        response.message = str(done.get("message", response.result))
+        response.forward_cm = float(done.get("forwardCm", 0.0))
+        response.strafe_cm = float(done.get("strafeCm", 0.0))
+        response.heading_deg = float(done.get("headingDeg", self._current_heading_deg()))
+        return response
+
+    def _handle_rotate(self, request: RotateCommand.Request, response: RotateCommand.Response) -> RotateCommand.Response:
+        direction = request.direction.strip().lower()
+        if direction not in {"left", "right", "ccw", "cw"}:
+            response.ok = False
+            response.result = "invalid_direction"
+            response.message = "direction must be left/right or ccw/cw"
+            response.heading_deg = self._current_heading_deg()
+            return response
+        sign = 1.0 if direction in {"left", "ccw"} else -1.0
+        target = self._current_heading_deg() + sign * abs(float(request.degrees))
+
+        with self.motion_lock:
+            active = self._active_ir() if self.mode == "manual" else []
+            if active:
+                self._stop_robot()
+                self._set_buzzer(True)
+                self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+                response.ok = False
+                response.result = "manual_ir_stop"
+                response.message = f"manual obstacle stop: {active}"
+                response.heading_deg = self._current_heading_deg()
+                return response
+            self._publish_event(f"rotate {direction} {request.degrees:.1f}deg target={target:.1f}")
+            future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+            result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+            if result is not None:
+                done = self._move_done_from_response(result)
+            else:
+                self._stop_robot()
+                done = MoveDone(result="timeout_stop", heading_deg=self._current_heading_deg()).as_dict()
+
+        response.ok = done.get("result") == "completed"
+        response.result = str(done.get("result", ""))
+        response.message = str(done.get("message", response.result))
+        response.heading_deg = float(done.get("headingDeg", self._current_heading_deg()))
+        return response
+
+    def _handle_start_audit(self, request: AuditMission.Request, response: AuditMission.Response) -> AuditMission.Response:
+        shelves = [int(shelf) for shelf in request.shelves if 1 <= int(shelf) <= 4]
+        levels = []
+        if request.level_1:
+            levels.append(1)
+        if request.level_2:
+            levels.append(2)
+        if not shelves:
+            response.accepted = False
+            response.message = "select at least one shelf"
+            return response
+        if not levels:
+            response.accepted = False
+            response.message = "select at least one level"
+            return response
+        if not self.allow_placeholder_audit:
+            response.accepted = False
+            response.message = (
+                "audit mission UI is wired, but shelf path execution is locked until final map dimensions are confirmed"
+            )
+            return response
+
+        if self.mission_running:
+            response.accepted = False
+            response.message = "mission already running"
+            return response
+        self.cancel_mission.clear()
+        self.mission_running = True
+        threading.Thread(target=self._run_placeholder_audit, args=(shelves, levels), daemon=True).start()
+        response.accepted = True
+        response.message = f"audit mission started shelves={shelves} levels={levels}"
+        return response
+
+    def _run_placeholder_audit(self, shelves: list[int], levels: list[int]) -> None:
+        try:
+            with self.mode_lock:
+                self.mode = "mission"
+            for shelf in shelves:
+                if self.cancel_mission.is_set():
+                    return
+                self._publish_event(f"audit shelf {shelf}: placeholder navigation")
+                for level in levels:
+                    if self.cancel_mission.is_set():
+                        return
+                    self._publish_event(f"audit shelf {shelf} level {level}: vision placeholder")
+                    if level == 2:
+                        self._run_lift(self.lift_steps, 1)
+                        self._run_lift(self.lift_steps, -1)
+            self._publish_event("audit mission complete")
+        finally:
+            self.mission_running = False
+            with self.mode_lock:
+                self.mode = "manual"
+
+    def _run_lift(self, steps: int, direction: int) -> None:
+        req = LiftMoveSteps.Request()
+        req.steps = abs(int(steps))
+        req.direction = 1 if direction >= 0 else -1
+        req.speed_sps = self.lift_speed_sps
+        self._call_sync(self.lift_client, req, max(5.0, steps / max(1.0, self.lift_speed_sps) + 2.0))
+
+    def _handle_manager_stop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        self.cancel_mission.set()
+        self._stop_robot()
+        self._set_buzzer(False)
+        with self.mode_lock:
+            self.mode = "manual"
+        response.success = True
+        response.message = "robot stopped and manager set to manual"
+        self._publish_event(response.message)
+        return response
+
+
+def main() -> None:
+    rclpy.init()
+    node = RobotManager()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

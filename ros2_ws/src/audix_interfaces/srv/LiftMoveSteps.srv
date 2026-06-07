@@ -1,0 +1,6 @@
+int32 steps
+int32 direction
+float32 speed_sps
+---
+bool ok
+string message

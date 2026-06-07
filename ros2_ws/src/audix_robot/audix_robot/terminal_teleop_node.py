@@ -15,7 +15,7 @@ class TerminalTeleop(Node):
         self.declare_parameter("rpm", 25.0)
         self.declare_parameter("timeout_s", 0.3)
         self.twist_client = self.create_client(TwistCommand, "/audix/twist")
-        self.stop_client = self.create_client(Trigger, "/audix/esp/stop")
+        self.stop_client = self.create_client(Trigger, "/audix/manager/stop")
         self.reset_client = self.create_client(Trigger, "/audix/esp/reset_odom")
         self.init_imu_client = self.create_client(Trigger, "/audix/esp/init_imu")
 
@@ -30,7 +30,7 @@ class TerminalTeleop(Node):
     def wait_for_services(self) -> None:
         for name, client in (
             ("/audix/twist", self.twist_client),
-            ("/audix/esp/stop", self.stop_client),
+            ("/audix/manager/stop", self.stop_client),
             ("/audix/esp/reset_odom", self.reset_client),
             ("/audix/esp/init_imu", self.init_imu_client),
         ):

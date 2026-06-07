@@ -15,6 +15,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/Move.srv"
   "srv/RawCommand.srv"
   "srv/TwistCommand.srv"
+  "srv/DirectionCommand.srv"
+  "srv/RotateCommand.srv"
+  "srv/SetRobotMode.srv"
+  "srv/LiftMoveSteps.srv"
+  "srv/AuditMission.srv"
   DEPENDENCIES std_msgs
 )
 
