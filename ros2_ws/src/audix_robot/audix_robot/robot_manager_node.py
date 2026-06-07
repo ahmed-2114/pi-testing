@@ -12,6 +12,7 @@ from typing import Callable
 import rclpy
 from audix_interfaces.msg import EspTelemetry, IrState
 from audix_interfaces.srv import AuditMission, DirectionCommand, LiftMoveSteps, Move, RotateCommand, SetRobotMode
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -35,6 +36,31 @@ DIRECTION_ANGLES_DEG = {
     "L": 90.0,
     "FL": 45.0,
 }
+MAP_MOVE_OK_RESULTS = {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "none"}
+
+
+@dataclass(frozen=True)
+class MapPoint:
+    x_cm: float
+    y_cm: float
+
+
+class AudixStoreMap:
+    WIDTH_CM = 250.0
+    HEIGHT_CM = 200.0
+    ROBOT_WIDTH_CM = 30.0
+    ROBOT_LENGTH_CM = 40.0
+    SPAWN = MapPoint(15.0, 165.0)
+    TOP_TRAVEL_Y_CM = 165.0
+    AUDIT_Y_CM = 80.0
+    LANE_CENTER_X_CM = {1: 50.0, 2: 200.0}
+    SIDE_NAME = {1: "left shelf side", 2: "right shelf side"}
+    FACE_ROTATION = {1: "right", 2: "left"}
+    RETURN_ROTATION = {1: "left", 2: "right"}
+    SHELF_X_MIN_CM = 105.0
+    SHELF_X_MAX_CM = 145.0
+    SHELF_Y_MIN_CM = 75.0
+    SHELF_Y_MAX_CM = 125.0
 
 
 @dataclass
@@ -162,6 +188,7 @@ class MissionMemory:
 class RobotManager(Node):
     def __init__(self) -> None:
         super().__init__("robot_manager")
+        self.callback_group = ReentrantCallbackGroup()
         self.mode = "manual"
         self.mode_lock = threading.Lock()
         self.motion_lock = threading.Lock()
@@ -173,6 +200,7 @@ class RobotManager(Node):
         self.manual_stop_last_s = 0.0
         self.mission_running = False
         self.cancel_mission = threading.Event()
+        self.map_pose = AudixStoreMap.SPAWN
 
         self.args = MissionArgs(
             goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
@@ -181,23 +209,23 @@ class RobotManager(Node):
         self.allow_placeholder_audit = bool(self.declare_parameter("allow_placeholder_audit", False).value)
         self.buzzer_hold_s = float(self.declare_parameter("manual_buzzer_hold_s", 1.5).value)
         self.lift_steps = int(self.declare_parameter("audit_lift_steps", 500).value)
-        self.lift_speed_sps = float(self.declare_parameter("lift_speed_sps", 275.0).value)
+        self.lift_speed_sps = float(self.declare_parameter("lift_speed_sps", 500.0).value)
 
-        self.move_client = self.create_client(Move, "move")
-        self.stop_client = self.create_client(Trigger, "esp/stop")
-        self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer")
-        self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps")
+        self.move_client = self.create_client(Move, "move", callback_group=self.callback_group)
+        self.stop_client = self.create_client(Trigger, "esp/stop", callback_group=self.callback_group)
+        self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
+        self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps", callback_group=self.callback_group)
 
-        self.create_subscription(IrState, "ir/state", self._on_ir, 10)
-        self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10)
+        self.create_subscription(IrState, "ir/state", self._on_ir, 10, callback_group=self.callback_group)
+        self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10, callback_group=self.callback_group)
         self.event_pub = self.create_publisher(String, "mission/event", 20)
 
-        self.create_service(SetRobotMode, "manager/set_mode", self._handle_set_mode)
-        self.create_service(DirectionCommand, "manager/direction_move", self._handle_direction_move)
-        self.create_service(RotateCommand, "manager/rotate", self._handle_rotate)
-        self.create_service(AuditMission, "manager/start_audit", self._handle_start_audit)
-        self.create_service(Trigger, "manager/stop", self._handle_manager_stop)
-        self.create_timer(0.05, self._manual_safety_tick)
+        self.create_service(SetRobotMode, "manager/set_mode", self._handle_set_mode, callback_group=self.callback_group)
+        self.create_service(DirectionCommand, "manager/direction_move", self._handle_direction_move, callback_group=self.callback_group)
+        self.create_service(RotateCommand, "manager/rotate", self._handle_rotate, callback_group=self.callback_group)
+        self.create_service(AuditMission, "manager/start_audit", self._handle_start_audit, callback_group=self.callback_group)
+        self.create_service(Trigger, "manager/stop", self._handle_manager_stop, callback_group=self.callback_group)
+        self.create_timer(0.05, self._manual_safety_tick, callback_group=self.callback_group)
         self.get_logger().info("Robot manager ready")
 
     def _on_ir(self, msg: IrState) -> None:
@@ -227,7 +255,7 @@ class RobotManager(Node):
         return sorted(name for name in names if self.latest_ir.get(name, False))
 
     def _call_sync(self, client, request, timeout_s: float):
-        if not client.wait_for_service(timeout_sec=max(0.1, min(timeout_s, 1.0))):
+        if not client.wait_for_service(timeout_sec=max(0.1, float(timeout_s))):
             raise RuntimeError(f"service unavailable: {client.srv_name}")
         event = threading.Event()
         holder = {}
@@ -270,6 +298,8 @@ class RobotManager(Node):
             self._set_buzzer(False)
 
     def _send_move_future(self, angle_deg: float, distance_m: float, heading_deg: float, timeout_s: float):
+        if not self.move_client.wait_for_service(timeout_sec=max(0.1, min(float(timeout_s), 3.0))):
+            raise RuntimeError(f"service unavailable: {self.move_client.srv_name}")
         request = Move.Request()
         request.angle_deg = float(angle_deg)
         request.distance_m = max(0.0, float(distance_m))
@@ -589,6 +619,135 @@ class RobotManager(Node):
             done = self._handle_ir_stop(done.get("ir", []), action_budget, mission)
         return done
 
+    def _reset_map_pose(self) -> None:
+        self.map_pose = AudixStoreMap.SPAWN
+        self._publish_event(
+            f"map pose reset x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
+        )
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_mission.is_set():
+            raise RuntimeError("mission cancelled")
+
+    def _execute_mapped_move(self, direction: str, distance_cm: float, target: MapPoint, label: str) -> None:
+        self._raise_if_cancelled()
+        distance_cm = abs(float(distance_cm))
+        if distance_cm <= 0.25:
+            self.map_pose = target
+            return
+
+        self._publish_event(
+            f"map move {label}: {direction} {distance_cm:.1f}cm -> x={target.x_cm:.1f} y={target.y_cm:.1f}"
+        )
+        done = self._mission_direction_move(direction, distance_cm, 0.0)
+        result = str(done.get("result", ""))
+        if result not in MAP_MOVE_OK_RESULTS:
+            raise RuntimeError(f"map move {label} failed: {result or done.get('message', 'unknown')}")
+        self.map_pose = target
+
+    def _move_map_x(self, target_x_cm: float, label: str) -> None:
+        dx = float(target_x_cm) - self.map_pose.x_cm
+        if abs(dx) <= 0.25:
+            self.map_pose = MapPoint(float(target_x_cm), self.map_pose.y_cm)
+            return
+        direction = "R" if dx > 0.0 else "L"
+        self._execute_mapped_move(
+            direction,
+            abs(dx),
+            MapPoint(float(target_x_cm), self.map_pose.y_cm),
+            label,
+        )
+
+    def _move_map_y(self, target_y_cm: float, label: str) -> None:
+        dy = float(target_y_cm) - self.map_pose.y_cm
+        if abs(dy) <= 0.25:
+            self.map_pose = MapPoint(self.map_pose.x_cm, float(target_y_cm))
+            return
+        direction = "B" if dy > 0.0 else "F"
+        self._execute_mapped_move(
+            direction,
+            abs(dy),
+            MapPoint(self.map_pose.x_cm, float(target_y_cm)),
+            label,
+        )
+
+    def _go_to_audit_side(self, side: int) -> None:
+        lane_x = AudixStoreMap.LANE_CENTER_X_CM[side]
+        side_name = AudixStoreMap.SIDE_NAME[side]
+        self._publish_event(
+            f"target {side_name}: lane_x={lane_x:.1f} audit_y={AudixStoreMap.AUDIT_Y_CM:.1f}"
+        )
+        self._move_map_y(AudixStoreMap.TOP_TRAVEL_Y_CM, "top clear corridor")
+        self._move_map_x(lane_x, f"{side_name} lane center")
+        self._move_map_y(AudixStoreMap.AUDIT_Y_CM, f"{side_name} audit row")
+
+    def _execute_rotation_in_place(self, direction: str, degrees: float, label: str) -> None:
+        self._raise_if_cancelled()
+        direction = direction.lower()
+        sign = -1.0 if direction in {"left", "ccw"} else 1.0
+        target = self._current_heading_deg() + sign * abs(float(degrees))
+        timeout_s = max(10.0, abs(float(degrees)) / 18.0 + 5.0)
+        self._publish_event(f"rotate {label}: {direction} {degrees:.1f}deg")
+        future = self._send_move_future(0.0, 0.0, target, timeout_s)
+        result = self._wait_future_response(future, timeout_s)
+        if result is None:
+            self._stop_robot()
+            raise TimeoutError(f"timed out rotating {label}")
+        done = self._move_done_from_response(result)
+        if done.get("result") != "completed":
+            raise RuntimeError(f"rotation {label} failed: {done.get('message', done.get('result', 'unknown'))}")
+        self.args.heading = float(done.get("headingDeg", target))
+
+    def _capture_level_placeholder(self, side: int, level: int) -> None:
+        self._raise_if_cancelled()
+        self._publish_event(f"audit {AudixStoreMap.SIDE_NAME[side]} level {level}: vision placeholder")
+        time.sleep(2.0)
+
+    def _audit_side_levels(self, side: int, levels: list[int]) -> None:
+        if 1 in levels:
+            self._capture_level_placeholder(side, 1)
+        if 2 in levels:
+            self._run_lift(self.lift_steps, 1)
+            try:
+                self._capture_level_placeholder(side, 2)
+            finally:
+                self._run_lift(self.lift_steps, -1)
+
+    def _run_map_audit(self, sides: list[int], levels: list[int]) -> None:
+        try:
+            with self.mode_lock:
+                self.mode = "mission"
+            self._reset_map_pose()
+            self._publish_event(
+                "map mission start "
+                f"size={AudixStoreMap.WIDTH_CM:.0f}x{AudixStoreMap.HEIGHT_CM:.0f}cm "
+                f"sides={sides} levels={levels}"
+            )
+
+            for side in sides:
+                self._raise_if_cancelled()
+                self._go_to_audit_side(side)
+                face_direction = AudixStoreMap.FACE_ROTATION[side]
+                return_direction = AudixStoreMap.RETURN_ROTATION[side]
+                self._execute_rotation_in_place(face_direction, 90.0, f"face {AudixStoreMap.SIDE_NAME[side]}")
+                try:
+                    self._audit_side_levels(side, levels)
+                finally:
+                    if not self.cancel_mission.is_set():
+                        self._execute_rotation_in_place(return_direction, 90.0, "return forward")
+
+            self._publish_event(
+                f"audit mission complete x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
+            )
+        except Exception as exc:
+            self._stop_robot()
+            self._set_buzzer(False)
+            self._publish_event(f"audit mission stopped: {exc}")
+        finally:
+            self.mission_running = False
+            with self.mode_lock:
+                self.mode = "manual"
+
     def _handle_set_mode(self, request: SetRobotMode.Request, response: SetRobotMode.Response) -> SetRobotMode.Response:
         mode = request.mode.strip().lower()
         if mode not in {"manual", "mission", "idle"}:
@@ -619,30 +778,41 @@ class RobotManager(Node):
             return response
 
         with self.motion_lock:
-            with self.mode_lock:
-                mode = self.mode
-            if mode == "manual":
-                active = self._active_ir()
-                if active:
-                    self._stop_robot()
-                    self._set_buzzer(True)
-                    self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
-                    response.ok = False
-                    response.result = "manual_ir_stop"
-                    response.message = f"manual obstacle stop: {active}"
-                    return response
-                angle = DIRECTION_ANGLES_DEG[direction]
-                done = self._execute_segment(
-                    angle,
-                    max(0.0, float(request.distance_cm)) / 100.0,
-                    set(),
-                    None,
-                    label=f"manual {direction}",
-                    move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
-                    timeout_returns_done=True,
-                )
-            else:
-                done = self._mission_direction_move(direction, float(request.distance_cm), float(request.timeout_s))
+            try:
+                with self.mode_lock:
+                    mode = self.mode
+                if mode == "manual":
+                    active = self._active_ir()
+                    if active:
+                        self._stop_robot()
+                        self._set_buzzer(True)
+                        self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+                        response.ok = False
+                        response.result = "manual_ir_stop"
+                        response.message = f"manual obstacle stop: {active}"
+                        return response
+                    angle = DIRECTION_ANGLES_DEG[direction]
+                    done = self._execute_segment(
+                        angle,
+                        max(0.0, float(request.distance_cm)) / 100.0,
+                        set(),
+                        None,
+                        label=f"manual {direction}",
+                        move_timeout_s=float(request.timeout_s) if request.timeout_s > 0.0 else self.args.move_timeout,
+                        timeout_returns_done=True,
+                    )
+                else:
+                    done = self._mission_direction_move(direction, float(request.distance_cm), float(request.timeout_s))
+            except Exception as exc:
+                self._stop_robot()
+                self.get_logger().error(f"direction move failed: {exc}")
+                response.ok = False
+                response.result = "error"
+                response.message = str(exc)
+                response.forward_cm = 0.0
+                response.strafe_cm = 0.0
+                response.heading_deg = self._current_heading_deg()
+                return response
 
         response.ok = done.get("result") in {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "none"}
         response.result = str(done.get("result", ""))
@@ -660,28 +830,37 @@ class RobotManager(Node):
             response.message = "direction must be left/right or ccw/cw"
             response.heading_deg = self._current_heading_deg()
             return response
-        sign = 1.0 if direction in {"left", "ccw"} else -1.0
+        sign = -1.0 if direction in {"left", "ccw"} else 1.0
         target = self._current_heading_deg() + sign * abs(float(request.degrees))
 
         with self.motion_lock:
-            active = self._active_ir() if self.mode == "manual" else []
-            if active:
+            try:
+                active = self._active_ir() if self.mode == "manual" else []
+                if active:
+                    self._stop_robot()
+                    self._set_buzzer(True)
+                    self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+                    response.ok = False
+                    response.result = "manual_ir_stop"
+                    response.message = f"manual obstacle stop: {active}"
+                    response.heading_deg = self._current_heading_deg()
+                    return response
+                self._publish_event(f"rotate {direction} {request.degrees:.1f}deg target={target:.1f}")
+                future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+                result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
+                if result is not None:
+                    done = self._move_done_from_response(result)
+                else:
+                    self._stop_robot()
+                    done = MoveDone(result="timeout_stop", heading_deg=self._current_heading_deg()).as_dict()
+            except Exception as exc:
                 self._stop_robot()
-                self._set_buzzer(True)
-                self.manual_buzzer_until = time.monotonic() + self.buzzer_hold_s
+                self.get_logger().error(f"rotate failed: {exc}")
                 response.ok = False
-                response.result = "manual_ir_stop"
-                response.message = f"manual obstacle stop: {active}"
+                response.result = "error"
+                response.message = str(exc)
                 response.heading_deg = self._current_heading_deg()
                 return response
-            self._publish_event(f"rotate {direction} {request.degrees:.1f}deg target={target:.1f}")
-            future = self._send_move_future(0.0, 0.0, target, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
-            result = self._wait_future_response(future, float(request.timeout_s) if request.timeout_s > 0.0 else 10.0)
-            if result is not None:
-                done = self._move_done_from_response(result)
-            else:
-                self._stop_robot()
-                done = MoveDone(result="timeout_stop", heading_deg=self._current_heading_deg()).as_dict()
 
         response.ok = done.get("result") == "completed"
         response.result = str(done.get("result", ""))
@@ -690,25 +869,19 @@ class RobotManager(Node):
         return response
 
     def _handle_start_audit(self, request: AuditMission.Request, response: AuditMission.Response) -> AuditMission.Response:
-        shelves = [int(shelf) for shelf in request.shelves if 1 <= int(shelf) <= 4]
+        sides = [int(side) for side in request.shelves if 1 <= int(side) <= 2]
         levels = []
         if request.level_1:
             levels.append(1)
         if request.level_2:
             levels.append(2)
-        if not shelves:
+        if not sides:
             response.accepted = False
-            response.message = "select at least one shelf"
+            response.message = "select at least one shelf side"
             return response
         if not levels:
             response.accepted = False
             response.message = "select at least one level"
-            return response
-        if not self.allow_placeholder_audit:
-            response.accepted = False
-            response.message = (
-                "audit mission UI is wired, but shelf path execution is locked until final map dimensions are confirmed"
-            )
             return response
 
         if self.mission_running:
@@ -717,38 +890,18 @@ class RobotManager(Node):
             return response
         self.cancel_mission.clear()
         self.mission_running = True
-        threading.Thread(target=self._run_placeholder_audit, args=(shelves, levels), daemon=True).start()
+        threading.Thread(target=self._run_map_audit, args=(sides, levels), daemon=True).start()
         response.accepted = True
-        response.message = f"audit mission started shelves={shelves} levels={levels}"
+        response.message = f"audit mission started sides={sides} levels={levels}"
         return response
-
-    def _run_placeholder_audit(self, shelves: list[int], levels: list[int]) -> None:
-        try:
-            with self.mode_lock:
-                self.mode = "mission"
-            for shelf in shelves:
-                if self.cancel_mission.is_set():
-                    return
-                self._publish_event(f"audit shelf {shelf}: placeholder navigation")
-                for level in levels:
-                    if self.cancel_mission.is_set():
-                        return
-                    self._publish_event(f"audit shelf {shelf} level {level}: vision placeholder")
-                    if level == 2:
-                        self._run_lift(self.lift_steps, 1)
-                        self._run_lift(self.lift_steps, -1)
-            self._publish_event("audit mission complete")
-        finally:
-            self.mission_running = False
-            with self.mode_lock:
-                self.mode = "manual"
 
     def _run_lift(self, steps: int, direction: int) -> None:
         req = LiftMoveSteps.Request()
-        req.steps = abs(int(steps))
+        abs_steps = abs(int(steps))
+        req.steps = abs_steps
         req.direction = 1 if direction >= 0 else -1
         req.speed_sps = self.lift_speed_sps
-        self._call_sync(self.lift_client, req, max(5.0, steps / max(1.0, self.lift_speed_sps) + 2.0))
+        self._call_sync(self.lift_client, req, max(5.0, abs_steps / max(1.0, self.lift_speed_sps) + 2.0))
 
     def _handle_manager_stop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.cancel_mission.set()
@@ -765,7 +918,7 @@ class RobotManager(Node):
 def main() -> None:
     rclpy.init()
     node = RobotManager()
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()

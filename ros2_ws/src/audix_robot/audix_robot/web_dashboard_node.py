@@ -11,6 +11,7 @@ from typing import Any
 import rclpy
 from audix_interfaces.msg import EspTelemetry, IrState
 from audix_interfaces.srv import AuditMission, DirectionCommand, LiftMoveSteps, RotateCommand, SetRobotMode
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -67,9 +68,9 @@ INDEX_HTML = r"""<!doctype html>
     .ir { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 8px; }
     .pill { border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; color: var(--muted); }
     .pill.on { color: white; background: #4a1c22; border-color: var(--danger); }
-    .shelves { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 8px; }
+    .sides { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
     label { color: var(--muted); font-size: 13px; }
-    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .shelves { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .sides { grid-template-columns: repeat(1, minmax(0,1fr)); } }
   </style>
 </head>
 <body>
@@ -144,18 +145,16 @@ INDEX_HTML = r"""<!doctype html>
     <section class="wide">
       <h2>Mission Audit</h2>
       <div class="panel">
-        <div class="shelves">
-          <label><input type="checkbox" class="shelf" value="1" checked /> Shelf 1</label>
-          <label><input type="checkbox" class="shelf" value="2" /> Shelf 2</label>
-          <label><input type="checkbox" class="shelf" value="3" /> Shelf 3</label>
-          <label><input type="checkbox" class="shelf" value="4" /> Shelf 4</label>
+        <div class="sides">
+          <label><input type="checkbox" class="side" value="1" checked /> Lane 1 side</label>
+          <label><input type="checkbox" class="side" value="2" /> Lane 2 side</label>
         </div>
         <div class="row" style="margin-top:10px">
           <label><input id="level1" type="checkbox" checked /> Level 1</label>
           <label><input id="level2" type="checkbox" checked /> Level 2</label>
           <button class="accent" onclick="startAudit()">Start Audit</button>
-          <button class="warn" onclick="lift(500, 1)">Lift +500</button>
-          <button class="warn" onclick="lift(500, -1)">Lift -500</button>
+          <button class="warn" onclick="lift(500)">Jog +500</button>
+          <button class="warn" onclick="lift(-500)">Jog -500</button>
         </div>
       </div>
     </section>
@@ -186,9 +185,9 @@ function stopRobot() { post('/api/stop'); }
 function setMode(mode) { post('/api/mode', {mode}); }
 function trigger(path) { post(path); }
 function buzzer(on) { post('/api/buzzer', {on}); }
-function lift(steps, direction) { post('/api/lift', {steps, direction}); }
+function lift(steps) { post('/api/lift', {steps}); }
 function startAudit() {
-  const shelves = [...document.querySelectorAll('.shelf:checked')].map(x => Number(x.value));
+  const shelves = [...document.querySelectorAll('.side:checked')].map(x => Number(x.value));
   post('/api/audit', {shelves, level_1: document.getElementById('level1').checked, level_2: document.getElementById('level2').checked});
 }
 function setText(id, value) { document.getElementById(id).textContent = value; }
@@ -222,6 +221,7 @@ refresh();
 class DashboardNode(Node):
     def __init__(self) -> None:
         super().__init__("web_dashboard")
+        self.callback_group = ReentrantCallbackGroup()
         self.host = str(self.declare_parameter("host", "0.0.0.0").value)
         self.port = int(self.declare_parameter("port", 8080).value)
         self.mode = "manual"
@@ -230,19 +230,19 @@ class DashboardNode(Node):
         self.latest_telemetry: dict[str, Any] = {}
         self.telemetry_stamp = 0.0
 
-        self.direction_client = self.create_client(DirectionCommand, "manager/direction_move")
-        self.rotate_client = self.create_client(RotateCommand, "manager/rotate")
-        self.mode_client = self.create_client(SetRobotMode, "manager/set_mode")
-        self.audit_client = self.create_client(AuditMission, "manager/start_audit")
-        self.stop_client = self.create_client(Trigger, "manager/stop")
-        self.init_imu_client = self.create_client(Trigger, "esp/init_imu")
-        self.reset_odom_client = self.create_client(Trigger, "esp/reset_odom")
-        self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer")
-        self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps")
+        self.direction_client = self.create_client(DirectionCommand, "manager/direction_move", callback_group=self.callback_group)
+        self.rotate_client = self.create_client(RotateCommand, "manager/rotate", callback_group=self.callback_group)
+        self.mode_client = self.create_client(SetRobotMode, "manager/set_mode", callback_group=self.callback_group)
+        self.audit_client = self.create_client(AuditMission, "manager/start_audit", callback_group=self.callback_group)
+        self.stop_client = self.create_client(Trigger, "manager/stop", callback_group=self.callback_group)
+        self.init_imu_client = self.create_client(Trigger, "esp/init_imu", callback_group=self.callback_group)
+        self.reset_odom_client = self.create_client(Trigger, "esp/reset_odom", callback_group=self.callback_group)
+        self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
+        self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps", callback_group=self.callback_group)
 
-        self.create_subscription(IrState, "ir/state", self._on_ir, 10)
-        self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10)
-        self.create_subscription(String, "mission/event", self._on_event, 20)
+        self.create_subscription(IrState, "ir/state", self._on_ir, 10, callback_group=self.callback_group)
+        self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10, callback_group=self.callback_group)
+        self.create_subscription(String, "mission/event", self._on_event, 20, callback_group=self.callback_group)
 
         handler = self._make_handler()
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
@@ -278,7 +278,7 @@ class DashboardNode(Node):
         self.last_event = msg.data
 
     def _call_sync(self, client, request, timeout_s: float = 10.0):
-        if not client.wait_for_service(timeout_sec=1.0):
+        if not client.wait_for_service(timeout_sec=max(0.1, float(timeout_s))):
             raise RuntimeError(f"service unavailable: {client.srv_name}")
         event = threading.Event()
         holder = {}
@@ -376,10 +376,16 @@ class DashboardNode(Node):
                         res = node._call_sync(node.buzzer_client, req, 3.0)
                         self._json({"ok": res.success, "message": res.message})
                     elif self.path == "/api/lift":
+                        raw_steps = int(data.get("steps", 0))
+                        if "direction" in data:
+                            direction = 1 if int(data.get("direction", 1)) >= 0 else -1
+                            signed_steps = abs(raw_steps) * direction
+                        else:
+                            signed_steps = raw_steps
                         req = LiftMoveSteps.Request()
-                        req.steps = abs(int(data.get("steps", 0)))
-                        req.direction = 1 if int(data.get("direction", 1)) >= 0 else -1
-                        req.speed_sps = float(data.get("speed_sps", 275.0))
+                        req.steps = abs(signed_steps)
+                        req.direction = 1 if signed_steps >= 0 else -1
+                        req.speed_sps = float(data.get("speed_sps", 500.0))
                         res = node._call_sync(node.lift_client, req, 15.0)
                         self._json({"ok": res.ok, "message": res.message})
                     else:
@@ -401,7 +407,7 @@ class DashboardNode(Node):
 def main() -> None:
     rclpy.init()
     node = DashboardNode()
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()

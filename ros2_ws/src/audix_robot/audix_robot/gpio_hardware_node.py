@@ -9,6 +9,8 @@ from typing import Any
 
 import rclpy
 from audix_interfaces.srv import LiftMoveSteps
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_srvs.srv import SetBool
 
@@ -18,7 +20,7 @@ STEPPER_DIR_PIN = 13
 STEPPER_EN_PIN = 5
 STEPPER_STEP_HIGH_US = 10
 STEPPER_DIR_SETUP_S = 0.010
-STEPPER_SPEED_SPS = 275.0
+STEPPER_SPEED_SPS = 500.0
 STEPPER_UP_DIR = 1
 STEPPER_DOWN_DIR = -1
 DEFAULT_BUZZER_PIN = 19
@@ -27,6 +29,7 @@ DEFAULT_BUZZER_PIN = 19
 class GpioHardware(Node):
     def __init__(self) -> None:
         super().__init__("gpio_hardware")
+        self.callback_group = ReentrantCallbackGroup()
         self.mock_gpio = bool(self.declare_parameter("mock_gpio", False).value)
         self.buzzer_pin = int(self.declare_parameter("buzzer_pin", DEFAULT_BUZZER_PIN).value)
         self.buzzer_active_high = bool(self.declare_parameter("buzzer_active_high", True).value)
@@ -47,8 +50,8 @@ class GpioHardware(Node):
         else:
             self._open_gpio()
 
-        self.create_service(SetBool, "gpio/set_buzzer", self._handle_set_buzzer)
-        self.create_service(LiftMoveSteps, "lift/move_steps", self._handle_lift_move_steps)
+        self.create_service(SetBool, "gpio/set_buzzer", self._handle_set_buzzer, callback_group=self.callback_group)
+        self.create_service(LiftMoveSteps, "lift/move_steps", self._handle_lift_move_steps, callback_group=self.callback_group)
         self.get_logger().info("GPIO hardware services ready")
 
     def _open_gpio(self) -> None:
@@ -90,7 +93,8 @@ class GpioHardware(Node):
         response: LiftMoveSteps.Response,
     ) -> LiftMoveSteps.Response:
         steps = abs(int(request.steps))
-        direction = STEPPER_UP_DIR if int(request.direction) >= 0 else STEPPER_DOWN_DIR
+        logical_direction = 1 if int(request.direction) >= 0 else -1
+        pin_direction = STEPPER_UP_DIR if logical_direction >= 0 else STEPPER_DOWN_DIR
         speed_sps = float(request.speed_sps) if request.speed_sps > 0.0 else self.default_speed_sps
 
         if steps <= 0:
@@ -99,7 +103,7 @@ class GpioHardware(Node):
             return response
         if self.mock_gpio:
             response.ok = True
-            response.message = f"mock lift steps={steps} direction={direction} speed={speed_sps:.1f}"
+            response.message = self._lift_message(steps, logical_direction, speed_sps, mock=True)
             return response
         if self.step_device is None or self.dir_device is None or self.en_device is None:
             response.ok = False
@@ -107,15 +111,22 @@ class GpioHardware(Node):
             return response
 
         try:
-            self._run_steps(steps, direction, speed_sps)
+            self._run_steps(steps, pin_direction, speed_sps)
         except Exception as exc:
             response.ok = False
             response.message = str(exc)
             return response
 
         response.ok = True
-        response.message = f"lift moved steps={steps} direction={direction}"
+        response.message = self._lift_message(steps, logical_direction, speed_sps)
         return response
+
+    @staticmethod
+    def _lift_message(steps: int, logical_direction: int, speed_sps: float, *, mock: bool = False) -> str:
+        signed_steps = steps if logical_direction >= 0 else -steps
+        direction_name = "up" if logical_direction >= 0 else "down"
+        prefix = "mock lift" if mock else "lift moved"
+        return f"{prefix} jog={signed_steps} direction={direction_name} speed={speed_sps:.1f}"
 
     def _run_steps(self, steps: int, direction: int, speed_sps: float) -> None:
         interval_us = int(1_000_000.0 / max(1.0, speed_sps))
@@ -165,9 +176,12 @@ class GpioHardware(Node):
 def main() -> None:
     rclpy.init()
     node = GpioHardware()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

@@ -18,6 +18,7 @@ from typing import Any
 import rclpy
 from audix_interfaces.msg import EspTelemetry, IrState
 from audix_interfaces.srv import Move, RawCommand, TwistCommand
+from rclpy.callback_groups import ReentrantCallbackGroup
 from nav_msgs.msg import Odometry
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -216,6 +217,7 @@ class AudixEspUartBridge(Node):
 
     def __init__(self) -> None:
         super().__init__("audix_esp_uart_bridge")
+        self.callback_group = ReentrantCallbackGroup()
 
         self.port = self.declare_parameter("port", "/dev/ttyAMA0").value
         self.baud = int(self.declare_parameter("baud", DEFAULT_BAUD).value)
@@ -261,18 +263,18 @@ class AudixEspUartBridge(Node):
         self.odom_pub = self.create_publisher(Odometry, "odom", 10)
         self.ir_pub = self.create_publisher(IrState, "ir/state", 10)
 
-        self.create_service(Trigger, "esp/ping", self._handle_ping)
-        self.create_service(Trigger, "esp/init_imu", self._handle_init_imu)
-        self.create_service(Trigger, "esp/reset_odom", self._handle_reset_odom)
-        self.create_service(Trigger, "esp/reset_encoders", self._handle_reset_encoders)
-        self.create_service(Trigger, "esp/stop", self._handle_stop)
-        self.create_service(Move, "move", self._handle_move)
-        self.create_service(TwistCommand, "twist", self._handle_twist)
-        self.create_service(RawCommand, "esp/raw_command", self._handle_raw_command)
+        self.create_service(Trigger, "esp/ping", self._handle_ping, callback_group=self.callback_group)
+        self.create_service(Trigger, "esp/init_imu", self._handle_init_imu, callback_group=self.callback_group)
+        self.create_service(Trigger, "esp/reset_odom", self._handle_reset_odom, callback_group=self.callback_group)
+        self.create_service(Trigger, "esp/reset_encoders", self._handle_reset_encoders, callback_group=self.callback_group)
+        self.create_service(Trigger, "esp/stop", self._handle_stop, callback_group=self.callback_group)
+        self.create_service(Move, "move", self._handle_move, callback_group=self.callback_group)
+        self.create_service(TwistCommand, "twist", self._handle_twist, callback_group=self.callback_group)
+        self.create_service(RawCommand, "esp/raw_command", self._handle_raw_command, callback_group=self.callback_group)
 
-        self.create_timer(max(0.005, self.telemetry_period_s), self._drain_telemetry)
+        self.create_timer(max(0.005, self.telemetry_period_s), self._drain_telemetry, callback_group=self.callback_group)
         if self.ir_enabled:
-            self.create_timer(max(0.01, self.ir_poll_period_s), self._publish_ir)
+            self.create_timer(max(0.01, self.ir_poll_period_s), self._publish_ir, callback_group=self.callback_group)
 
         self._startup_handshake()
         self.get_logger().info(f"Audix ESP UART bridge ready on {self.port} @ {self.baud}")
@@ -527,7 +529,7 @@ class AudixEspUartBridge(Node):
 def main() -> None:
     rclpy.init()
     node = AudixEspUartBridge()
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
