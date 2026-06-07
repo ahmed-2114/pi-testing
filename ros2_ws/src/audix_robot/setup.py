@@ -20,6 +20,8 @@ setup(
     entry_points={
         "console_scripts": [
             "esp_uart_bridge_node = audix_robot.esp_uart_bridge_node:main",
+            "terminal_move_node = audix_robot.terminal_move_node:main",
+            "terminal_teleop_node = audix_robot.terminal_teleop_node:main",
         ],
     },
 )
