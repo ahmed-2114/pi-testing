@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetRobotMode.srv"
   "srv/LiftMoveSteps.srv"
   "srv/AuditMission.srv"
+  "srv/ShelfScan.srv"
   DEPENDENCIES std_msgs
 )
 

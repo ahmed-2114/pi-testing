@@ -1,0 +1,13 @@
+string shelf_id
+---
+bool success
+string shelf_id
+string expected_product
+int32 expected_count
+int32 detected_count
+string[] detected_products
+string[] wrong_products
+float32 confidence
+string status
+string message
+string image_path

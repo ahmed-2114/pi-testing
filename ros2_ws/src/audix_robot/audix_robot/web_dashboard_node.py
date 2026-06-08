@@ -6,14 +6,26 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import cv2
 import rclpy
 from audix_interfaces.msg import EspTelemetry, IrState
-from audix_interfaces.srv import AuditMission, DirectionCommand, LiftMoveSteps, RotateCommand, SetRobotMode
+from audix_interfaces.srv import (
+    AuditMission,
+    DirectionCommand,
+    LiftMoveSteps,
+    RotateCommand,
+    SetRobotMode,
+    ShelfScan,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 
@@ -69,8 +81,11 @@ INDEX_HTML = r"""<!doctype html>
     .pill { border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; color: var(--muted); }
     .pill.on { color: white; background: #4a1c22; border-color: var(--danger); }
     .sides { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+    .vision { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; margin-top: 10px; }
+    .camera-feed { width: 100%; max-height: 320px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; background: #07090c; margin-bottom: 10px; }
+    .scan-image { display: none; width: 100%; max-height: 260px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; background: #07090c; }
     label { color: var(--muted); font-size: 13px; }
-    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .sides { grid-template-columns: repeat(1, minmax(0,1fr)); } }
+    @media (max-width: 860px) { section { grid-column: span 12; } .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); } .sides, .vision { grid-template-columns: repeat(1, minmax(0,1fr)); } }
   </style>
 </head>
 <body>
@@ -124,6 +139,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row">
           <button onclick="trigger('/api/init_imu')">Init IMU</button>
           <button onclick="trigger('/api/reset_odom')">Reset Odom</button>
+          <button onclick="homeRobot()">Home</button>
           <button onclick="buzzer(true)">Buzzer On</button>
           <button onclick="buzzer(false)">Buzzer Off</button>
         </div>
@@ -160,6 +176,28 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <section class="wide">
+      <h2>Vision</h2>
+      <div class="panel">
+        <img id="cameraFeed" class="camera-feed" alt="camera feed" />
+        <div class="row">
+          <select id="scanShelf">
+            <option value="indomie">Indomie</option>
+            <option value="beans_can">Beans Can</option>
+            <option value="fruit_rings_cereal">Fruit Rings</option>
+          </select>
+          <button class="accent" onclick="scanShelf()">Scan</button>
+        </div>
+        <div class="vision">
+          <div class="metric"><span>Status</span><strong id="scanStatus">-</strong></div>
+          <div class="metric"><span>Count</span><strong id="scanCount">-</strong></div>
+          <div class="metric"><span>Confidence</span><strong id="scanConfidence">-</strong></div>
+        </div>
+        <div id="scanMessage" style="color:var(--muted); margin-top:8px; overflow-wrap:anywhere"></div>
+        <img id="scanImage" class="scan-image" alt="latest scan" />
+      </div>
+    </section>
+
+    <section class="wide">
       <h2>Log</h2>
       <div id="log" class="panel log"></div>
     </section>
@@ -167,6 +205,8 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 <script>
 const logEl = document.getElementById('log');
+let lastSeenEvent = '';
+let lastCameraOk = false;
 function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
@@ -182,22 +222,54 @@ function rotdeg() { return Number(document.getElementById('rotdeg').value || 0);
 function moveDir(direction) { post('/api/move', {direction, distance_cm: dist()}); }
 function rotate(direction) { post('/api/rotate', {direction, degrees: rotdeg()}); }
 function stopRobot() { post('/api/stop'); }
+function homeRobot() { post('/api/home'); }
 function setMode(mode) { post('/api/mode', {mode}); }
 function trigger(path) { post(path); }
 function buzzer(on) { post('/api/buzzer', {on}); }
 function lift(steps) { post('/api/lift', {steps}); }
+async function scanShelf() {
+  const shelf_id = document.getElementById('scanShelf').value;
+  const data = await post('/api/scan', {shelf_id});
+  if (data.scan) renderScan(data.scan);
+}
 function startAudit() {
   const shelves = [...document.querySelectorAll('.side:checked')].map(x => Number(x.value));
   post('/api/audit', {shelves, level_1: document.getElementById('level1').checked, level_2: document.getElementById('level2').checked});
 }
 function setText(id, value) { document.getElementById(id).textContent = value; }
 function setIr(id, active) { document.getElementById(id).classList.toggle('on', !!active); }
+function renderScan(scan) {
+  setText('scanStatus', scan?.status || '-');
+  const count = scan ? `${scan.detected_count ?? 0}/${scan.expected_count ?? 0}` : '-';
+  setText('scanCount', count);
+  const confidence = Number(scan?.confidence ?? 0);
+  setText('scanConfidence', scan ? confidence.toFixed(2) : '-');
+  const wrong = (scan?.wrong_products || []).join(', ');
+  const location = scan?.side && scan?.level ? `side ${scan.side} level ${scan.level} | ` : '';
+  document.getElementById('scanMessage').textContent = scan ? `${location}${scan.shelf_id}: ${scan.message || ''}${wrong ? ' | wrong: ' + wrong : ''}` : '';
+  const img = document.getElementById('scanImage');
+  if (scan?.image_path) {
+    img.src = `/api/audit_image?path=${encodeURIComponent(scan.image_path)}&t=${Date.now()}`;
+    img.style.display = 'block';
+  } else {
+    img.removeAttribute('src');
+    img.style.display = 'none';
+  }
+}
+function refreshCamera() {
+  const img = document.getElementById('cameraFeed');
+  img.src = `/api/camera.jpg?t=${Date.now()}`;
+}
 async function refresh() {
   try {
     const res = await fetch('/api/status');
     const s = await res.json();
     setText('mode', s.mode || '-');
     setText('event', s.last_event || '');
+    if (s.last_event && s.last_event !== lastSeenEvent) {
+      lastSeenEvent = s.last_event;
+      log(`event: ${s.last_event}`);
+    }
     setText('age', Number(s.telemetry_age_s ?? 0).toFixed(2) + 's');
     setText('forward', Number(s.telemetry?.forward_cm ?? 0).toFixed(1));
     setText('strafe', Number(s.telemetry?.strafe_cm ?? 0).toFixed(1));
@@ -206,12 +278,15 @@ async function refresh() {
     setText('move', s.telemetry?.mode || '-');
     setText('seq', s.telemetry?.seq ?? '-');
     for (const [name, active] of Object.entries(s.ir || {})) setIr('ir_' + name, active);
+    if (s.latest_scan) renderScan(s.latest_scan);
   } catch (e) {
     setText('event', 'dashboard disconnected');
   }
 }
 setInterval(refresh, 250);
+setInterval(refreshCamera, 300);
 refresh();
+refreshCamera();
 </script>
 </body>
 </html>
@@ -228,21 +303,34 @@ class DashboardNode(Node):
         self.last_event = "ready"
         self.latest_ir: dict[str, bool] = {}
         self.latest_telemetry: dict[str, Any] = {}
+        self.latest_scan: dict[str, Any] | None = None
         self.telemetry_stamp = 0.0
+        self.audit_image_dir = str(self.declare_parameter("audit_image_dir", "~/audix/audit_images").value)
+        self.camera_jpeg_quality = int(self.declare_parameter("camera_jpeg_quality", 75).value)
+        self.camera_min_period_s = float(self.declare_parameter("camera_min_period_s", 0.20).value)
+        self.camera_lock = threading.Lock()
+        self.camera_bridge = CvBridge()
+        self.latest_camera_jpeg: bytes | None = None
+        self.camera_stamp = 0.0
+        self.last_camera_encode_s = 0.0
 
         self.direction_client = self.create_client(DirectionCommand, "manager/direction_move", callback_group=self.callback_group)
         self.rotate_client = self.create_client(RotateCommand, "manager/rotate", callback_group=self.callback_group)
         self.mode_client = self.create_client(SetRobotMode, "manager/set_mode", callback_group=self.callback_group)
         self.audit_client = self.create_client(AuditMission, "manager/start_audit", callback_group=self.callback_group)
+        self.home_client = self.create_client(Trigger, "manager/go_home", callback_group=self.callback_group)
         self.stop_client = self.create_client(Trigger, "manager/stop", callback_group=self.callback_group)
         self.init_imu_client = self.create_client(Trigger, "esp/init_imu", callback_group=self.callback_group)
         self.reset_odom_client = self.create_client(Trigger, "esp/reset_odom", callback_group=self.callback_group)
         self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
         self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps", callback_group=self.callback_group)
+        self.scan_client = self.create_client(ShelfScan, "scan_shelf", callback_group=self.callback_group)
 
         self.create_subscription(IrState, "ir/state", self._on_ir, 10, callback_group=self.callback_group)
         self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10, callback_group=self.callback_group)
+        self.create_subscription(Image, "image_raw", self._on_camera, 5, callback_group=self.callback_group)
         self.create_subscription(String, "mission/event", self._on_event, 20, callback_group=self.callback_group)
+        self.create_subscription(String, "vision/scan_result", self._on_scan_result, 10, callback_group=self.callback_group)
 
         handler = self._make_handler()
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
@@ -277,6 +365,48 @@ class DashboardNode(Node):
     def _on_event(self, msg: String) -> None:
         self.last_event = msg.data
 
+    def _on_scan_result(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+            self.latest_scan = {
+                "success": bool(data.get("success", False)),
+                "side": int(data.get("side", 0)),
+                "level": int(data.get("level", 0)),
+                "shelf_id": str(data.get("shelf_id", "")),
+                "expected_product": str(data.get("expected_product", "")),
+                "expected_count": int(data.get("expected_count", 0)),
+                "detected_count": int(data.get("detected_count", 0)),
+                "detected_products": list(data.get("detected_products", [])),
+                "wrong_products": list(data.get("wrong_products", [])),
+                "confidence": float(data.get("confidence", 0.0)),
+                "status": str(data.get("status", "")),
+                "message": str(data.get("message", "")),
+                "image_path": str(data.get("image_path", "")),
+            }
+        except Exception as exc:
+            self.get_logger().warning(f"bad scan result message: {exc}")
+
+    def _on_camera(self, msg: Image) -> None:
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_camera_encode_s < max(0.05, self.camera_min_period_s):
+            return
+        try:
+            frame = self.camera_bridge.imgmsg_to_cv2(msg, "bgr8")
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), max(25, min(95, self.camera_jpeg_quality))],
+            )
+            if not ok:
+                return
+        except Exception as exc:
+            self.get_logger().warning(f"camera encode failed: {exc}")
+            return
+        with self.camera_lock:
+            self.latest_camera_jpeg = encoded.tobytes()
+            self.camera_stamp = now
+            self.last_camera_encode_s = now
+
     def _call_sync(self, client, request, timeout_s: float = 10.0):
         if not client.wait_for_service(timeout_sec=max(0.1, float(timeout_s))):
             raise RuntimeError(f"service unavailable: {client.srv_name}")
@@ -296,6 +426,24 @@ class DashboardNode(Node):
             "ir": self.latest_ir,
             "telemetry": self.latest_telemetry,
             "telemetry_age_s": max(0.0, now - self.telemetry_stamp) if self.telemetry_stamp else None,
+            "latest_scan": self.latest_scan,
+            "camera_age_s": max(0.0, now - self.camera_stamp) if self.camera_stamp else None,
+        }
+
+    @staticmethod
+    def _scan_to_dict(res) -> dict[str, Any]:
+        return {
+            "success": bool(res.success),
+            "shelf_id": str(res.shelf_id),
+            "expected_product": str(res.expected_product),
+            "expected_count": int(res.expected_count),
+            "detected_count": int(res.detected_count),
+            "detected_products": list(res.detected_products),
+            "wrong_products": list(res.wrong_products),
+            "confidence": float(res.confidence),
+            "status": str(res.status),
+            "message": str(res.message),
+            "image_path": str(res.image_path),
         }
 
     def _make_handler(self):
@@ -322,12 +470,38 @@ class DashboardNode(Node):
                 return json.loads(self.rfile.read(length).decode("utf-8"))
 
             def do_GET(self) -> None:
-                if self.path == "/" or self.path == "/index.html":
+                parsed = urlparse(self.path)
+                if parsed.path == "/" or parsed.path == "/index.html":
                     self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
-                elif self.path == "/api/status":
+                elif parsed.path == "/api/status":
                     self._json(node._status())
+                elif parsed.path == "/api/audit_image":
+                    params = parse_qs(parsed.query)
+                    image_path = params.get("path", [""])[0]
+                    self._send_audit_image(image_path)
+                elif parsed.path == "/api/camera.jpg":
+                    self._send_camera_frame()
                 else:
                     self._json({"ok": False, "message": "not found"}, 404)
+
+            def _send_camera_frame(self) -> None:
+                with node.camera_lock:
+                    frame = node.latest_camera_jpeg
+                if frame is None:
+                    self._json({"ok": False, "message": "no camera frame yet"}, 404)
+                    return
+                self._send(200, frame, "image/jpeg")
+
+            def _send_audit_image(self, image_path: str) -> None:
+                base = Path(node.audit_image_dir).expanduser().resolve()
+                try:
+                    requested = Path(image_path).expanduser().resolve()
+                    if not requested.is_file() or (requested != base and base not in requested.parents):
+                        self._json({"ok": False, "message": "image not found"}, 404)
+                        return
+                    self._send(200, requested.read_bytes(), "image/jpeg")
+                except Exception as exc:
+                    self._json({"ok": False, "message": str(exc)}, 404)
 
             def do_POST(self) -> None:
                 try:
@@ -364,6 +538,10 @@ class DashboardNode(Node):
                         res = node._call_sync(node.stop_client, Trigger.Request(), 5.0)
                         node.mode = "manual"
                         self._json({"ok": res.success, "message": res.message})
+                    elif self.path == "/api/home":
+                        res = node._call_sync(node.home_client, Trigger.Request(), 220.0)
+                        node.mode = "manual"
+                        self._json({"ok": res.success, "message": res.message})
                     elif self.path == "/api/init_imu":
                         res = node._call_sync(node.init_imu_client, Trigger.Request(), 12.0)
                         self._json({"ok": res.success, "message": res.message})
@@ -388,6 +566,13 @@ class DashboardNode(Node):
                         req.speed_sps = float(data.get("speed_sps", 500.0))
                         res = node._call_sync(node.lift_client, req, 15.0)
                         self._json({"ok": res.ok, "message": res.message})
+                    elif self.path == "/api/scan":
+                        req = ShelfScan.Request()
+                        req.shelf_id = str(data.get("shelf_id", ""))
+                        res = node._call_sync(node.scan_client, req, 30.0)
+                        scan = node._scan_to_dict(res)
+                        node.latest_scan = scan
+                        self._json({"ok": res.success, "message": res.message, "scan": scan})
                     else:
                         self._json({"ok": False, "message": "not found"}, 404)
                 except Exception as exc:

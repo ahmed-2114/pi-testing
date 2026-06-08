@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -11,7 +12,15 @@ from typing import Callable
 
 import rclpy
 from audix_interfaces.msg import EspTelemetry, IrState
-from audix_interfaces.srv import AuditMission, DirectionCommand, LiftMoveSteps, Move, RotateCommand, SetRobotMode
+from audix_interfaces.srv import (
+    AuditMission,
+    DirectionCommand,
+    LiftMoveSteps,
+    Move,
+    RotateCommand,
+    SetRobotMode,
+    ShelfScan,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -96,7 +105,7 @@ class MissionArgs:
     front_dynamic_hold: float = 3.0
     front_strafe_distance: float = 0.20
     front_corner_strafe_distance: float = 0.15
-    front_advance_distance: float = 0.30
+    front_advance_distance: float = 0.20
     front_strafe_search_distance: float = 1.20
     front_corner_buffer_distance: float = 0.05
     front_strafe_search_timeout: float = 8.0
@@ -161,6 +170,7 @@ class PoseAccumulator:
 class MissionMemory:
     forward_m: float = 0.0
     lateral_m: float = 0.0
+    lateral_reference_m: float = 0.0
 
     def record_completed_move(self, angle_deg: float, distance_m: float, done: dict) -> None:
         if done.get("result") == "ir_stop":
@@ -178,7 +188,11 @@ class MissionMemory:
 
     def sync_from_pose(self, pose_tracker: PoseAccumulator) -> None:
         self.forward_m = max(0.0, -pose_tracker.x)
-        self.lateral_m = -pose_tracker.y
+        self.lateral_m = -pose_tracker.y - self.lateral_reference_m
+
+    def reset_lateral_reference(self, pose_tracker: PoseAccumulator) -> None:
+        self.lateral_reference_m = -pose_tracker.y
+        self.lateral_m = 0.0
 
     def snap_center_if_close(self, tolerance_m: float) -> None:
         if abs(self.lateral_m) <= tolerance_m:
@@ -194,6 +208,7 @@ class RobotManager(Node):
         self.motion_lock = threading.Lock()
         self.latest_ir = {name: False for name in IR_SENSOR_ORDER}
         self.latest_telemetry: EspTelemetry | None = None
+        self.latest_telemetry_time_s = 0.0
         self.pose = PoseAccumulator()
         self.last_event = "ready"
         self.manual_buzzer_until = 0.0
@@ -210,20 +225,31 @@ class RobotManager(Node):
         self.buzzer_hold_s = float(self.declare_parameter("manual_buzzer_hold_s", 1.5).value)
         self.lift_steps = int(self.declare_parameter("audit_lift_steps", 500).value)
         self.lift_speed_sps = float(self.declare_parameter("lift_speed_sps", 500.0).value)
+        self.scan_timeout_s = float(self.declare_parameter("vision_scan_timeout_s", 25.0).value)
+        self.scan_settle_s = float(self.declare_parameter("vision_scan_settle_s", 0.5).value)
+        self.audit_shelf_ids = {
+            (1, 1): str(self.declare_parameter("audit_side_1_level_1_shelf_id", "indomie").value),
+            (1, 2): str(self.declare_parameter("audit_side_1_level_2_shelf_id", "beans_can").value),
+            (2, 1): str(self.declare_parameter("audit_side_2_level_1_shelf_id", "fruit_rings_cereal").value),
+            (2, 2): str(self.declare_parameter("audit_side_2_level_2_shelf_id", "indomie").value),
+        }
 
         self.move_client = self.create_client(Move, "move", callback_group=self.callback_group)
         self.stop_client = self.create_client(Trigger, "esp/stop", callback_group=self.callback_group)
         self.buzzer_client = self.create_client(SetBool, "gpio/set_buzzer", callback_group=self.callback_group)
         self.lift_client = self.create_client(LiftMoveSteps, "lift/move_steps", callback_group=self.callback_group)
+        self.scan_client = self.create_client(ShelfScan, "scan_shelf", callback_group=self.callback_group)
 
         self.create_subscription(IrState, "ir/state", self._on_ir, 10, callback_group=self.callback_group)
         self.create_subscription(EspTelemetry, "esp/telemetry", self._on_telemetry, 10, callback_group=self.callback_group)
         self.event_pub = self.create_publisher(String, "mission/event", 20)
+        self.scan_result_pub = self.create_publisher(String, "vision/scan_result", 10)
 
         self.create_service(SetRobotMode, "manager/set_mode", self._handle_set_mode, callback_group=self.callback_group)
         self.create_service(DirectionCommand, "manager/direction_move", self._handle_direction_move, callback_group=self.callback_group)
         self.create_service(RotateCommand, "manager/rotate", self._handle_rotate, callback_group=self.callback_group)
         self.create_service(AuditMission, "manager/start_audit", self._handle_start_audit, callback_group=self.callback_group)
+        self.create_service(Trigger, "manager/go_home", self._handle_go_home, callback_group=self.callback_group)
         self.create_service(Trigger, "manager/stop", self._handle_manager_stop, callback_group=self.callback_group)
         self.create_timer(0.05, self._manual_safety_tick, callback_group=self.callback_group)
         self.get_logger().info("Robot manager ready")
@@ -240,6 +266,7 @@ class RobotManager(Node):
 
     def _on_telemetry(self, msg: EspTelemetry) -> None:
         self.latest_telemetry = msg
+        self.latest_telemetry_time_s = time.monotonic()
         self.pose.set_from_telemetry(msg)
         self.args.heading = float(msg.yaw_deg)
 
@@ -547,10 +574,20 @@ class RobotManager(Node):
                 last_done = self._execute_side_escape(done.get("ir", []), action_budget, mission)
         raise RuntimeError("could not return to center")
 
-    def _execute_front_avoidance(self, ir_state: dict[str, bool], action_budget: list[int], mission: MissionMemory) -> dict:
+    def _execute_front_avoidance(
+        self,
+        ir_state: dict[str, bool],
+        action_budget: list[int],
+        mission: MissionMemory,
+        *,
+        reset_lateral_reference: bool = True,
+    ) -> dict:
         action_budget[0] -= 1
         if action_budget[0] < 0:
             raise RuntimeError("too many avoidance actions")
+        if reset_lateral_reference:
+            mission.reset_lateral_reference(self.pose)
+            self._publish_event("front avoidance lateral reference set")
         direction, reason = self._choose_front_avoidance(ir_state)
         if ir_state.get(side_sensor_for_direction(direction), False):
             direction = opposite_direction(direction)
@@ -703,13 +740,79 @@ class RobotManager(Node):
         self._publish_event(f"audit {AudixStoreMap.SIDE_NAME[side]} level {level}: vision placeholder")
         time.sleep(2.0)
 
+    def _scan_shelf_level(self, side: int, level: int) -> None:
+        self._raise_if_cancelled()
+        shelf_id = self.audit_shelf_ids.get((side, level), "")
+        if not shelf_id:
+            raise RuntimeError(f"no shelf id configured for side {side} level {level}")
+
+        self._publish_event(
+            f"ready facing {AudixStoreMap.SIDE_NAME[side]} level {level}: trigger scan {shelf_id}"
+        )
+        if self.scan_settle_s > 0.0:
+            time.sleep(self.scan_settle_s)
+        req = ShelfScan.Request()
+        req.shelf_id = shelf_id
+
+        try:
+            result = self._call_sync(self.scan_client, req, self.scan_timeout_s)
+        except Exception as exc:
+            if self.allow_placeholder_audit:
+                self._publish_event(
+                    f"vision unavailable for {shelf_id}: {exc}; using placeholder wait"
+                )
+                self._capture_level_placeholder(side, level)
+                return
+            raise
+
+        if not result.success:
+            self._publish_scan_result(side, level, result)
+            if self.allow_placeholder_audit:
+                self._publish_event(
+                    f"vision scan failed for {shelf_id}: {result.message}; using placeholder wait"
+                )
+                self._capture_level_placeholder(side, level)
+                return
+            raise RuntimeError(f"vision scan failed for {shelf_id}: {result.message}")
+
+        self._publish_event(
+            "vision "
+            f"{shelf_id}: {result.status} "
+            f"expected={result.expected_product} "
+            f"count={result.detected_count}/{result.expected_count} "
+            f"confidence={float(result.confidence):.2f} "
+            f"wrong={list(result.wrong_products)}"
+        )
+        self._publish_scan_result(side, level, result)
+
+    def _publish_scan_result(self, side: int, level: int, result) -> None:
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "success": bool(result.success),
+                "side": int(side),
+                "level": int(level),
+                "shelf_id": str(result.shelf_id),
+                "expected_product": str(result.expected_product),
+                "expected_count": int(result.expected_count),
+                "detected_count": int(result.detected_count),
+                "detected_products": list(result.detected_products),
+                "wrong_products": list(result.wrong_products),
+                "confidence": float(result.confidence),
+                "status": str(result.status),
+                "message": str(result.message),
+                "image_path": str(result.image_path),
+            }
+        )
+        self.scan_result_pub.publish(msg)
+
     def _audit_side_levels(self, side: int, levels: list[int]) -> None:
         if 1 in levels:
-            self._capture_level_placeholder(side, 1)
+            self._scan_shelf_level(side, 1)
         if 2 in levels:
             self._run_lift(self.lift_steps, 1)
             try:
-                self._capture_level_placeholder(side, 2)
+                self._scan_shelf_level(side, 2)
             finally:
                 self._run_lift(self.lift_steps, -1)
 
@@ -736,6 +839,7 @@ class RobotManager(Node):
                     if not self.cancel_mission.is_set():
                         self._execute_rotation_in_place(return_direction, 90.0, "return forward")
 
+            self._go_home_to_odom_zero("mission complete home")
             self._publish_event(
                 f"audit mission complete x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
             )
@@ -895,6 +999,88 @@ class RobotManager(Node):
         response.message = f"audit mission started sides={sides} levels={levels}"
         return response
 
+    def _wait_for_telemetry(
+        self,
+        *,
+        newer_than_s: float | None = None,
+        timeout_s: float = 2.0,
+    ) -> EspTelemetry:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() <= deadline:
+            telemetry = self.latest_telemetry
+            if telemetry is not None and (
+                newer_than_s is None or self.latest_telemetry_time_s > newer_than_s
+            ):
+                return telemetry
+            time.sleep(0.02)
+        if newer_than_s is None and self.latest_telemetry is not None:
+            return self.latest_telemetry
+        if newer_than_s is None:
+            raise RuntimeError("cannot home before telemetry is available")
+        raise RuntimeError("timed out waiting for fresh odom telemetry")
+
+    def _go_home_to_odom_zero(self, label: str) -> None:
+        self._raise_if_cancelled()
+        tolerance_cm = 1.0
+        max_passes = 6
+        telemetry = self._wait_for_telemetry(timeout_s=2.0)
+        forward_cm = float(telemetry.forward_cm)
+        strafe_cm = float(telemetry.strafe_cm)
+        self._publish_event(
+            f"{label}: odom forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
+        )
+
+        for home_pass in range(1, max_passes + 1):
+            self._raise_if_cancelled()
+            telemetry = self._wait_for_telemetry(timeout_s=1.0)
+            forward_cm = float(telemetry.forward_cm)
+            strafe_cm = float(telemetry.strafe_cm)
+            if abs(forward_cm) <= tolerance_cm and abs(strafe_cm) <= tolerance_cm:
+                break
+
+            if abs(forward_cm) > tolerance_cm:
+                direction = "B" if forward_cm > 0.0 else "F"
+                distance_cm = abs(forward_cm)
+                self._publish_event(
+                    f"{label}: home pass {home_pass} forward {direction} {distance_cm:.1f}cm"
+                )
+                done = self._mission_direction_move(direction, distance_cm, 0.0)
+                result = str(done.get("result", ""))
+                if result not in MAP_MOVE_OK_RESULTS:
+                    raise RuntimeError(
+                        f"home forward correction failed: {result or done.get('message', 'unknown')}"
+                    )
+                completed_s = time.monotonic()
+                self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+                continue
+
+            direction = "L" if strafe_cm > 0.0 else "R"
+            distance_cm = abs(strafe_cm)
+            self._publish_event(
+                f"{label}: home pass {home_pass} strafe {direction} {distance_cm:.1f}cm"
+            )
+            done = self._mission_direction_move(direction, distance_cm, 0.0)
+            result = str(done.get("result", ""))
+            if result not in MAP_MOVE_OK_RESULTS:
+                raise RuntimeError(
+                    f"home strafe correction failed: {result or done.get('message', 'unknown')}"
+                )
+            completed_s = time.monotonic()
+            self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
+
+        telemetry = self._wait_for_telemetry(timeout_s=1.0)
+        forward_cm = float(telemetry.forward_cm)
+        strafe_cm = float(telemetry.strafe_cm)
+        if abs(forward_cm) > tolerance_cm or abs(strafe_cm) > tolerance_cm:
+            raise RuntimeError(
+                f"home residual odom forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
+            )
+
+        self.map_pose = AudixStoreMap.SPAWN
+        self._publish_event(
+            f"home reached odom zero forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
+        )
+
     def _run_lift(self, steps: int, direction: int) -> None:
         req = LiftMoveSteps.Request()
         abs_steps = abs(int(steps))
@@ -902,6 +1088,29 @@ class RobotManager(Node):
         req.direction = 1 if direction >= 0 else -1
         req.speed_sps = self.lift_speed_sps
         self._call_sync(self.lift_client, req, max(5.0, abs_steps / max(1.0, self.lift_speed_sps) + 2.0))
+
+    def _handle_go_home(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if self.mission_running:
+            response.success = False
+            response.message = "cannot home while audit mission is running"
+            return response
+        with self.motion_lock:
+            try:
+                with self.mode_lock:
+                    previous_mode = self.mode
+                    self.mode = "mission"
+                self.cancel_mission.clear()
+                self._go_home_to_odom_zero("manual home")
+                response.success = True
+                response.message = "home reached odom zero"
+            except Exception as exc:
+                self._stop_robot()
+                response.success = False
+                response.message = str(exc)
+            finally:
+                with self.mode_lock:
+                    self.mode = previous_mode if "previous_mode" in locals() else "manual"
+        return response
 
     def _handle_manager_stop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self.cancel_mission.set()
