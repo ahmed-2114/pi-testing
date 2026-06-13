@@ -1,5 +1,9 @@
 # Audix ROS 2 Bridge
 
+> Current micro-ROS path: see `README_AUDIX_MICRO_ROS.md`. The launch files now
+> start `micro_ros_agent` and `micro_ros_base_node` by default. The UART JSON
+> bridge described below is the legacy rollback path for `esp_correct_pid_pi.ino`.
+
 This workspace turns the final working Audix files into a ROS-facing system without breaking the proven controller:
 
 - `current files/pi_master.py` stays as the reference non-ROS mission controller.

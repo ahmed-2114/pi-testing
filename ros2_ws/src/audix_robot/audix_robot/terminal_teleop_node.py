@@ -55,12 +55,12 @@ class TerminalTeleop(Node):
         future = self.twist_client.call_async(request)
         rclpy.spin_until_future_complete(self, future)
         result = future.result()
-        if result is None:
-            print("twist failed: no response", flush=True)
+        if result is None or not result.ok:
+            message = "no response" if result is None else result.message
+            print(f"twist failed: {message}", flush=True)
             return
         print(
-            f"twist: f={forward:.1f} s={strafe:.1f} t={turn:.1f} "
-            f"ok={result.ok} {result.message}",
+            f"twist: f={forward:.1f}rpm s={strafe:.1f}rpm t={turn:.1f}rpm",
             flush=True,
         )
 

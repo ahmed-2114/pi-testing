@@ -48,23 +48,25 @@ def generate_launch_description():
             DeclareLaunchArgument("vision_confidence", default_value="0.5"),
             DeclareLaunchArgument("vision_target_count", default_value="2"),
             DeclareLaunchArgument("vision_scan_settle", default_value="0.5"),
-            DeclareLaunchArgument("audit_side_1_level_1_shelf_id", default_value="indomie"),
-            DeclareLaunchArgument("audit_side_1_level_2_shelf_id", default_value="beans_can"),
-            DeclareLaunchArgument("audit_side_2_level_1_shelf_id", default_value="fruit_rings_cereal"),
-            DeclareLaunchArgument("audit_side_2_level_2_shelf_id", default_value="indomie"),
+            DeclareLaunchArgument("audit_side_1_level_1_shelf_id", default_value="beans_can"),
+            DeclareLaunchArgument("audit_side_1_level_2_shelf_id", default_value="indomie"),
+            DeclareLaunchArgument("audit_side_2_level_1_shelf_id", default_value="indomie"),
+            DeclareLaunchArgument("audit_side_2_level_2_shelf_id", default_value="fruit_rings_cereal"),
+            Node(
+                package="micro_ros_agent",
+                executable="micro_ros_agent",
+                name="micro_ros_agent",
+                output="screen",
+                arguments=["serial", "--dev", port, "--baudrate", baud],
+            ),
             Node(
                 package="audix_robot",
-                executable="esp_uart_bridge_node",
-                name="esp_uart_bridge",
+                executable="micro_ros_base_node",
+                name="micro_ros_base",
                 namespace=namespace,
                 output="screen",
                 parameters=[
                     {
-                        "port": port,
-                        "baud": ParameterValue(baud, value_type=int),
-                        "mock_ir": ParameterValue(mock_ir, value_type=bool),
-                        "ir_enabled": ParameterValue(ir_enabled, value_type=bool),
-                        "ir_logic": ir_logic,
                         "init_imu_on_start": ParameterValue(init_imu_on_start, value_type=bool),
                         "reset_odom_on_start": ParameterValue(reset_odom_on_start, value_type=bool),
                     }
@@ -79,6 +81,9 @@ def generate_launch_description():
                 parameters=[
                     {
                         "mock_gpio": ParameterValue(mock_gpio, value_type=bool),
+                        "mock_ir": ParameterValue(mock_ir, value_type=bool),
+                        "ir_enabled": ParameterValue(ir_enabled, value_type=bool),
+                        "ir_logic": ir_logic,
                     }
                 ],
             ),

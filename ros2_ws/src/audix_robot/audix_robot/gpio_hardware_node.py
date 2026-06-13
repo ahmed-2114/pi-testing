@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 import rclpy
+from audix_interfaces.msg import IrState
 from audix_interfaces.srv import LiftMoveSteps
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -24,6 +25,58 @@ STEPPER_SPEED_SPS = 500.0
 STEPPER_UP_DIR = 1
 STEPPER_DOWN_DIR = -1
 DEFAULT_BUZZER_PIN = 19
+IR_SENSOR_ORDER = ("front_left", "front", "front_right", "right", "back", "left")
+IR_PINS = {
+    "front_left": 23,
+    "front": 24,
+    "front_right": 25,
+    "right": 17,
+    "back": 27,
+    "left": 22,
+}
+
+
+class GpioIrBank:
+    """GPIO IR reader using the same sensor pins and logic as pi_master.py."""
+
+    def __init__(self, *, active_low: bool, pull_up: bool, mock: bool, logic: str, node: Node) -> None:
+        self.active_low = active_low
+        self.mock = mock
+        self.logic = logic
+        self.node = node
+        self.devices: dict[str, Any] = {}
+        self.baseline_raw: dict[str, bool] = {}
+
+        if self.mock:
+            return
+
+        from gpiozero import DigitalInputDevice
+
+        self.devices = {name: DigitalInputDevice(pin, pull_up=pull_up) for name, pin in IR_PINS.items()}
+        time.sleep(0.05)
+        self.baseline_raw = {name: bool(device.value) for name, device in self.devices.items()}
+        baseline = " ".join(f"{name}={1 if value else 0}" for name, value in self.baseline_raw.items())
+        self.node.get_logger().info(f"IR GPIO ready logic={self.logic} baseline {baseline}")
+
+    def read(self) -> dict[str, bool]:
+        if self.mock:
+            return {name: False for name in IR_SENSOR_ORDER}
+
+        state = {name: False for name in IR_SENSOR_ORDER}
+        for name, device in self.devices.items():
+            raw_high = bool(device.value)
+            if self.logic == "active-low":
+                state[name] = not raw_high
+            elif self.logic == "active-high":
+                state[name] = raw_high
+            else:
+                state[name] = raw_high != self.baseline_raw.get(name, raw_high)
+        return state
+
+    def close(self) -> None:
+        for device in self.devices.values():
+            device.close()
+        self.devices = {}
 
 
 class GpioHardware(Node):
@@ -31,6 +84,13 @@ class GpioHardware(Node):
         super().__init__("gpio_hardware")
         self.callback_group = ReentrantCallbackGroup()
         self.mock_gpio = bool(self.declare_parameter("mock_gpio", False).value)
+        self.ir_enabled = bool(self.declare_parameter("ir_enabled", True).value)
+        self.mock_ir = bool(self.declare_parameter("mock_ir", False).value)
+        self.ir_logic = str(self.declare_parameter("ir_logic", "baseline").value)
+        self.ir_active_low = bool(self.declare_parameter("ir_active_low", False).value)
+        self.ir_pull_up = bool(self.declare_parameter("ir_pull_up", False).value)
+        self.ir_poll_period_s = float(self.declare_parameter("ir_poll_period_s", 0.05).value)
+        self.base_frame_id = str(self.declare_parameter("base_frame_id", "base_link").value)
         self.buzzer_pin = int(self.declare_parameter("buzzer_pin", DEFAULT_BUZZER_PIN).value)
         self.buzzer_active_high = bool(self.declare_parameter("buzzer_active_high", True).value)
         self.step_pin = int(self.declare_parameter("step_pin", STEPPER_STEP_PIN).value)
@@ -43,6 +103,7 @@ class GpioHardware(Node):
         self.step_device: Any | None = None
         self.dir_device: Any | None = None
         self.en_device: Any | None = None
+        self.ir_bank: GpioIrBank | None = None
         self.stepper_lock = threading.Lock()
 
         if self.mock_gpio:
@@ -52,6 +113,16 @@ class GpioHardware(Node):
 
         self.create_service(SetBool, "gpio/set_buzzer", self._handle_set_buzzer, callback_group=self.callback_group)
         self.create_service(LiftMoveSteps, "lift/move_steps", self._handle_lift_move_steps, callback_group=self.callback_group)
+        if self.ir_enabled:
+            self.ir_bank = GpioIrBank(
+                active_low=self.ir_active_low,
+                pull_up=self.ir_pull_up,
+                mock=self.mock_ir,
+                logic=self.ir_logic,
+                node=self,
+            )
+            self.ir_pub = self.create_publisher(IrState, "ir/state", 10)
+            self.create_timer(max(0.01, self.ir_poll_period_s), self._publish_ir, callback_group=self.callback_group)
         self.get_logger().info("GPIO hardware services ready")
 
     def _open_gpio(self) -> None:
@@ -150,6 +221,22 @@ class GpioHardware(Node):
                 self.step_device.off()
                 self.en_device.on()
 
+    def _publish_ir(self) -> None:
+        if self.ir_bank is None:
+            return
+        state = self.ir_bank.read()
+        msg = IrState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.base_frame_id
+        msg.front_left = state["front_left"]
+        msg.front = state["front"]
+        msg.front_right = state["front_right"]
+        msg.right = state["right"]
+        msg.back = state["back"]
+        msg.left = state["left"]
+        msg.active = [name for name in IR_SENSOR_ORDER if state.get(name, False)]
+        self.ir_pub.publish(msg)
+
     def destroy_node(self) -> bool:
         for device, off_first in (
             (self.buzzer, True),
@@ -170,6 +257,9 @@ class GpioHardware(Node):
                 device.close()
             except Exception:
                 pass
+        if self.ir_bank is not None:
+            self.ir_bank.close()
+            self.ir_bank = None
         return super().destroy_node()
 
 

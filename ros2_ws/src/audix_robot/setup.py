@@ -22,7 +22,7 @@ setup(
     license="MIT",
     entry_points={
         "console_scripts": [
-            "esp_uart_bridge_node = audix_robot.esp_uart_bridge_node:main",
+            "micro_ros_base_node = audix_robot.micro_ros_base_node:main",
             "gpio_hardware_node = audix_robot.gpio_hardware_node:main",
             "robot_manager_node = audix_robot.robot_manager_node:main",
             "web_dashboard_node = audix_robot.web_dashboard_node:main",
