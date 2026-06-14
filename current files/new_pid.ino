@@ -255,8 +255,8 @@ float positionKi = 0.0f;
 float yawKp = 10.0f;
 float yawKi = 0.0f;
 float positionMaxRpm = 40.0f;
-float positionToleranceCm = 0.5f;
-float yawToleranceDeg = 1.0f;
+float positionToleranceCm = 2.0f;
+float yawToleranceDeg = 2.0f;
 bool imuOk = false;
 float imuYawDeg = 0.0f;
 float imuYawRawDeg = 0.0f;
@@ -1834,8 +1834,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         <label>Position Kp rpm/cm<input id="positionKp" type="number" min="0" step="0.05" value="100" /></label>
         <label>Heading Kp rpm/deg<input id="yawKp" type="number" min="0" step="0.05" value="10" /></label>
         <label>Position Max RPM<input id="positionMaxRpm" type="number" min="1" max="45" step="1" value="40" /></label>
-        <label>Position Tolerance cm<input id="positionToleranceCm" type="number" min="0.1" max="10" step="0.1" value="0.5" /></label>
-        <label>Heading Tolerance deg<input id="yawToleranceDeg" type="number" min="0.5" max="15" step="0.5" value="1" /></label>
+        <label>Position Tolerance cm<input id="positionToleranceCm" type="number" min="0.1" max="10" step="0.1" value="2.0" /></label>
+        <label>Heading Tolerance deg<input id="yawToleranceDeg" type="number" min="0.5" max="15" step="0.5" value="2.0" /></label>
         <label>Forward Odom Scale<input id="odomForwardScale" type="number" min="0.5" max="1.5" step="0.0005" value="0.9854" /></label>
         <label>Strafe Odom Scale<input id="odomStrafeScale" type="number" min="0.5" max="1.5" step="0.0005" value="0.9375" /></label>
       </div>

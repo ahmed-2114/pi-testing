@@ -479,8 +479,6 @@ class RobotManager(Node):
     def _front_avoidance_bias(self) -> tuple[int, int]:
         side = self._active_avoidance_side()
         bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
-        if self._heading_is_reversed():
-            bias = opposite_direction(bias)
         return side, bias
 
     def _map_direction_to_body_direction(self, direction: str) -> str:
@@ -494,6 +492,23 @@ class RobotManager(Node):
             "R": "L",
         }.get(direction, direction)
 
+    def _map_lateral_to_body_direction(self, direction: int) -> int:
+        if not self._heading_is_reversed():
+            return direction
+        return opposite_direction(direction)
+
+    def _body_lateral_to_map_direction(self, direction: int) -> int:
+        if not self._heading_is_reversed():
+            return direction
+        return opposite_direction(direction)
+
+    def _avoidance_direction_label(self, direction: int) -> str:
+        body_direction = self._map_lateral_to_body_direction(direction)
+        label = direction_name(direction)
+        if body_direction != direction:
+            label += f" (body {direction_name(body_direction)})"
+        return label
+
     def _choose_front_avoidance(self, ir_state: dict[str, bool]) -> tuple[int, str]:
         side, bias = self._front_avoidance_bias()
         front = bool(ir_state.get("front", False))
@@ -501,27 +516,28 @@ class RobotManager(Node):
         front_right = bool(ir_state.get("front_right", False))
         if front:
             if front_left and not front_right:
-                return RIGHT, "front+front_left"
+                return self._body_lateral_to_map_direction(RIGHT), "front+front_left"
             if front_right and not front_left:
-                return LEFT, "front+front_right"
+                return self._body_lateral_to_map_direction(LEFT), "front+front_right"
             return bias, f"front lane{side} bias {direction_name(bias)}"
         if front_left:
-            return RIGHT, "front_left"
+            return self._body_lateral_to_map_direction(RIGHT), "front_left"
         if front_right:
-            return LEFT, "front_right"
+            return self._body_lateral_to_map_direction(LEFT), "front_right"
         return bias, f"front lane{side} bias {direction_name(bias)}"
 
     def _execute_front_search_strafe(self, direction: int, mission: MissionMemory) -> tuple[dict, int, str]:
         for _attempt in range(2):
-            corner_sensor = front_corner_sensor_after_strafe(direction)
-            side_block_sensor = side_sensor_for_direction(direction)
+            body_direction = self._map_lateral_to_body_direction(direction)
+            corner_sensor = front_corner_sensor_after_strafe(body_direction)
+            side_block_sensor = side_sensor_for_direction(body_direction)
             watch = {corner_sensor, side_block_sensor}
             done = self._execute_segment(
-                direction_to_angle(direction),
+                direction_to_angle(body_direction),
                 self.args.front_strafe_search_distance,
                 watch,
                 mission,
-                label=f"front search strafe {direction_name(direction)}",
+                label=f"front search strafe {self._avoidance_direction_label(direction)}",
                 move_timeout_s=self.args.front_strafe_search_timeout,
                 timeout_returns_done=True,
             )
@@ -536,7 +552,8 @@ class RobotManager(Node):
         previous_active = bool(self.latest_ir.get(corner_sensor, False))
 
         def stop_predicate():
-            side_block_sensor = side_sensor_for_direction(direction)
+            body_direction = self._map_lateral_to_body_direction(direction)
+            side_block_sensor = side_sensor_for_direction(body_direction)
             if self.latest_ir.get(side_block_sensor, False):
                 return "ir_stop", [side_block_sensor]
             nonlocal previous_active
@@ -546,12 +563,13 @@ class RobotManager(Node):
             previous_active = active
             return None
 
+        body_direction = self._map_lateral_to_body_direction(direction)
         done = self._execute_move_watch(
-            direction_to_angle(direction),
+            direction_to_angle(body_direction),
             self.args.front_strafe_search_distance,
             set(),
             self.args.front_strafe_search_timeout,
-            label=f"strafe until {corner_sensor} falling",
+            label=f"strafe {self._avoidance_direction_label(direction)} until {corner_sensor} falling",
             stop_predicate=stop_predicate,
         )
         mission.sync_from_pose(self.pose)
@@ -603,12 +621,13 @@ class RobotManager(Node):
             previous_active = active
             return None
 
+        body_direction = self._map_lateral_to_body_direction(direction)
         done = self._execute_move_watch(
-            direction_to_angle(direction),
+            direction_to_angle(body_direction),
             self.args.side_follow_search_distance,
             set(),
             self.args.move_timeout,
-            label=f"strafe {direction_name(direction)} until back falling",
+            label=f"strafe {self._avoidance_direction_label(direction)} until back falling",
             stop_predicate=stop_predicate,
         )
         mission.sync_from_pose(self.pose)
@@ -617,9 +636,9 @@ class RobotManager(Node):
     def _side_path_direction(self, active_sensors: list[str]) -> int:
         active = set(active_sensors)
         if "right" in active and "left" not in active:
-            return RIGHT
+            return self._body_lateral_to_map_direction(RIGHT)
         if "left" in active and "right" not in active:
-            return LEFT
+            return self._body_lateral_to_map_direction(LEFT)
         return self._front_avoidance_bias()[1]
 
     def _execute_side_path_escape(self, active_sensors: list[str], action_budget: list[int], mission: MissionMemory) -> dict:
@@ -628,7 +647,7 @@ class RobotManager(Node):
             raise RuntimeError("too many avoidance actions")
         direction = self._side_path_direction(active_sensors)
         self._publish_event(
-            f"side path escape {active_sensors}: forward then {direction_name(direction)}"
+            f"side path escape {active_sensors}: forward then {self._avoidance_direction_label(direction)}"
         )
 
         done = self._execute_segment(
@@ -668,12 +687,13 @@ class RobotManager(Node):
                 mission.lateral_m = 0.0
                 return last_done
             direction = LEFT if offset > 0.0 else RIGHT
+            body_direction = self._map_lateral_to_body_direction(direction)
             done = self._execute_segment(
-                direction_to_angle(direction),
+                direction_to_angle(body_direction),
                 abs(offset),
-                {side_sensor_for_direction(direction)},
+                {side_sensor_for_direction(body_direction)},
                 mission,
-                label="return to center",
+                label=f"return to center {self._avoidance_direction_label(direction)}",
             )
             last_done = done
             if done.get("result") == "ir_stop":
@@ -690,7 +710,8 @@ class RobotManager(Node):
         done = self._execute_strafe_until_corner_falling(direction, corner_sensor, mission)
         if done.get("result") == "ir_stop":
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
-        side_sensor = side_sensor_after_front_avoidance(direction)
+        body_direction = self._map_lateral_to_body_direction(direction)
+        side_sensor = side_sensor_after_front_avoidance(body_direction)
         done = self._execute_forward_until_side_falling(side_sensor, mission)
         if done.get("result") == "ir_stop":
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
@@ -719,7 +740,8 @@ class RobotManager(Node):
         mission.reset_lateral_reference(self.pose)
         self._publish_event("front corner avoidance lateral reference set")
         direction, reason = self._choose_front_avoidance(ir_state)
-        if ir_state.get(side_sensor_for_direction(direction), False):
+        body_direction = self._map_lateral_to_body_direction(direction)
+        if ir_state.get(side_sensor_for_direction(body_direction), False):
             direction = opposite_direction(direction)
 
         if ir_state.get("front_left", False) and not ir_state.get("front_right", False):
@@ -730,7 +752,7 @@ class RobotManager(Node):
             return self._execute_front_avoidance(ir_state, action_budget, mission)
 
         self._publish_event(
-            f"front corner avoidance {reason}: strafe {direction_name(direction)} until {corner_sensor} clears"
+            f"front corner avoidance {reason}: strafe {self._avoidance_direction_label(direction)} until {corner_sensor} clears"
         )
         return self._finish_front_avoidance_after_corner(direction, corner_sensor, action_budget, mission)
 
@@ -749,9 +771,10 @@ class RobotManager(Node):
             mission.reset_lateral_reference(self.pose)
             self._publish_event("front avoidance lateral reference set")
         direction, reason = self._choose_front_avoidance(ir_state)
-        if ir_state.get(side_sensor_for_direction(direction), False):
+        body_direction = self._map_lateral_to_body_direction(direction)
+        if ir_state.get(side_sensor_for_direction(body_direction), False):
             direction = opposite_direction(direction)
-        self._publish_event(f"front avoidance {reason}: strafe {direction_name(direction)}")
+        self._publish_event(f"front avoidance {reason}: strafe {self._avoidance_direction_label(direction)}")
         done, direction, corner_sensor = self._execute_front_search_strafe(direction, mission)
         if done.get("result") == "ir_stop" and corner_sensor not in set(done.get("ir", [])):
             return self._handle_ir_stop(done.get("ir", []), action_budget, mission)
@@ -794,8 +817,8 @@ class RobotManager(Node):
         move_timeout_s: float | None = None,
         timeout_returns_done: bool = False,
     ) -> dict:
-        self._publish_event(f"{label}: rotate 180 then move forward")
-        self._execute_rotation_in_place("right", 180.0, f"{label} turn around")
+        self._publish_event(f"{label}: face heading 180 then move forward")
+        self._execute_rotation_to_heading(180.0, f"{label} turn around")
         return self._execute_segment(
             0.0,
             distance_m,
@@ -1039,18 +1062,22 @@ class RobotManager(Node):
                 f"sides={sides} levels={levels}"
             )
 
-            for side in sides:
+            for index, side in enumerate(sides):
                 self._raise_if_cancelled()
+                final_side = index == len(sides) - 1
                 self._go_to_audit_side(side)
                 face_direction = AudixStoreMap.FACE_ROTATION[side]
                 return_direction = AudixStoreMap.RETURN_ROTATION[side]
                 self._execute_rotation_in_place(face_direction, 90.0, f"face {AudixStoreMap.SIDE_NAME[side]}")
+                side_scans_complete = False
                 try:
                     self._audit_side_levels(side, levels)
+                    side_scans_complete = True
                 finally:
-                    if not self.cancel_mission.is_set():
+                    if not self.cancel_mission.is_set() and not (final_side and side_scans_complete):
                         self._execute_rotation_in_place(return_direction, 90.0, "return forward")
 
+            self._execute_rotation_to_heading(180.0, "mission complete face home")
             self._go_home_to_odom_zero("mission complete home")
             self._publish_event(
                 f"audit mission complete x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
