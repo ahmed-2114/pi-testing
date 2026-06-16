@@ -9,12 +9,12 @@ the ESP32 micro-ROS topics.
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 from typing import Any
 
 import rclpy
+from audix_robot.navigation_contract import body_delta_to_world
 from audix_interfaces.msg import EspTelemetry
 from audix_interfaces.srv import Move, RawCommand, TwistCommand
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -26,11 +26,6 @@ from std_srvs.srv import Trigger
 
 
 DEFAULT_MOVE_TIMEOUT_S = 180.0
-
-
-def _wrap_degrees(angle_deg: float) -> float:
-    wrapped = (float(angle_deg) + 180.0) % 360.0 - 180.0
-    return 180.0 if wrapped == -180.0 else wrapped
 
 
 class WorldOdomAccumulator:
@@ -46,7 +41,6 @@ class WorldOdomAccumulator:
     def update(self, body_forward_cm: float, body_strafe_cm: float, yaw_deg: float) -> tuple[float, float]:
         body_forward_cm = float(body_forward_cm)
         body_strafe_cm = float(body_strafe_cm)
-        yaw_rad = _wrap_degrees(yaw_deg) * 3.141592653589793 / 180.0
 
         if self.last_body_forward_cm is None or self.last_body_strafe_cm is None:
             self.last_body_forward_cm = body_forward_cm
@@ -71,10 +65,9 @@ class WorldOdomAccumulator:
         self.last_body_forward_cm = body_forward_cm
         self.last_body_strafe_cm = body_strafe_cm
 
-        cos_yaw = math.cos(yaw_rad)
-        sin_yaw = math.sin(yaw_rad)
-        self.forward_cm += cos_yaw * delta_forward_cm - sin_yaw * delta_strafe_cm
-        self.strafe_cm += sin_yaw * delta_forward_cm + cos_yaw * delta_strafe_cm
+        world_forward_cm, world_strafe_cm = body_delta_to_world(delta_forward_cm, delta_strafe_cm, yaw_deg)
+        self.forward_cm += world_forward_cm
+        self.strafe_cm += world_strafe_cm
         return self.forward_cm, self.strafe_cm
 
 

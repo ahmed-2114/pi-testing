@@ -156,8 +156,24 @@ Strafe right 10 cm:
 ros2 service call /audix/move audix_interfaces/srv/Move "{angle_deg: -90.0, distance_m: 0.10, heading_deg: 0.0, timeout_s: 10.0, wait_for_done: true}"
 ```
 
+Heading/yaw convention:
+
+```text
+0 deg    = forward / +x
+90 deg   = left / +y
+-90 deg  = right / -y
+180 deg  = backward / -x
+left/CCW rotation  = positive yaw
+right/CW rotation  = negative yaw
+```
+
 The ESP receives this as a ROS topic command on `/audix/esp/move_goal`, not as a
 UART text command.
+
+ESP firmware note: the ESP32 firmware is an Arduino `.ino` workflow. Do not use
+PlatformIO for this project, and do not expect Codex automation to upload or
+flash the ESP. Firmware source changes must be uploaded manually through the
+Arduino workflow.
 
 ## Inspect The ROS Graph
 

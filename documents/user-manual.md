@@ -236,6 +236,9 @@ Direction mapping:
 | `-90` | right |
 | `90` | left |
 
+Yaw follows the standard right-hand rule: rotating left/CCW increases heading,
+and rotating right/CW decreases heading.
+
 GPIO outputs for buzzer, traffic LEDs, and lift are saved for the later `audix_hardware` package. They are not available in the current `audix_robot` workspace.
 
 ## Suggested Test Order

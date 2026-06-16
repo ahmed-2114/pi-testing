@@ -523,8 +523,8 @@ Why you need it:
 Current caution:
 
 - The old `pi_master.py` uses its own sign convention where physical forward maps to negative local X in `PoseAccumulator`.
-- The ROS bridge uses standard ROS x-forward/y-left-ish odometry, with parameters `odom_forward_sign` and `odom_strafe_sign`.
-- When testing in RViz, verify forward and left/right directions and fix signs in parameters instead of changing ESP firmware first.
+- The ROS bridge uses standard ROS x-forward/y-left odometry. Positive yaw is left/CCW around +z; negative yaw is right/CW.
+- When testing in RViz, verify forward and left/right translation first and fix translation signs in parameters. If rotation is mirrored, keep the ROS-facing yaw convention and fix the ESP hardware-boundary rotate/yaw calibration.
 
 ## Services You Have Now
 

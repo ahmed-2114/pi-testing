@@ -21,6 +21,16 @@ from audix_interfaces.srv import (
     SetRobotMode,
     ShelfScan,
 )
+from audix_robot.navigation_contract import (
+    DIRECTION_ANGLES_DEG,
+    HEADING_BACKWARD_DEG,
+    HEADING_FORWARD_DEG,
+    HEADING_LEFT_DEG,
+    HEADING_RIGHT_DEG,
+    forward_heading_for_world_direction,
+    rotation_delta_for_turn_direction,
+    wrap_degrees,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -36,22 +46,7 @@ FRONT_WATCH_SENSORS = {"front", "front_left", "front_right"}
 SIDE_WATCH_SENSORS = {"left", "right"}
 ALL_WATCH_SENSORS = FRONT_WATCH_SENSORS | SIDE_WATCH_SENSORS
 
-DIRECTION_ANGLES_DEG = {
-    "F": 0.0,
-    "FR": -45.0,
-    "R": -90.0,
-    "BR": -135.0,
-    "B": 180.0,
-    "BL": 135.0,
-    "L": 90.0,
-    "FL": 45.0,
-}
 MAP_MOVE_OK_RESULTS = {"completed", "front_dynamic_clear", "side_falling", "corner_falling", "back_falling", "none"}
-
-
-def wrap_degrees(angle_deg: float) -> float:
-    wrapped = (float(angle_deg) + 180.0) % 360.0 - 180.0
-    return 180.0 if wrapped == -180.0 else wrapped
 
 
 @dataclass(frozen=True)
@@ -70,8 +65,7 @@ class AudixStoreMap:
     AUDIT_Y_CM = 80.0
     LANE_CENTER_X_CM = {1: 50.0, 2: 200.0}
     SIDE_NAME = {1: "left shelf side", 2: "right shelf side"}
-    FACE_ROTATION = {1: "right", 2: "left"}
-    RETURN_ROTATION = {1: "left", 2: "right"}
+    SCAN_HEADING_DEG = {1: HEADING_LEFT_DEG, 2: HEADING_RIGHT_DEG}
     FRONT_AVOIDANCE_BIAS = {1: LEFT, 2: RIGHT}
     SHELF_X_MIN_CM = 105.0
     SHELF_X_MAX_CM = 145.0
@@ -135,7 +129,7 @@ def opposite_direction(direction: int) -> int:
 
 
 def direction_to_angle(direction: int) -> float:
-    return 90.0 if direction == LEFT else -90.0
+    return HEADING_LEFT_DEG if direction == LEFT else HEADING_RIGHT_DEG
 
 
 def direction_name(direction: int) -> str:
@@ -231,6 +225,7 @@ class RobotManager(Node):
         self.cancel_mission = threading.Event()
         self.map_pose = AudixStoreMap.SPAWN
         self.current_audit_side: int | None = None
+        self.front_avoidance_bias_override: int | None = None
 
         self.args = MissionArgs(
             goal_distance=float(self.declare_parameter("goal_distance_m", 1.20).value),
@@ -478,6 +473,8 @@ class RobotManager(Node):
 
     def _front_avoidance_bias(self) -> tuple[int, int]:
         side = self._active_avoidance_side()
+        if self.front_avoidance_bias_override is not None:
+            return side, self.front_avoidance_bias_override
         bias = AudixStoreMap.FRONT_AVOIDANCE_BIAS.get(side, LEFT)
         return side, bias
 
@@ -818,9 +815,9 @@ class RobotManager(Node):
         timeout_returns_done: bool = False,
     ) -> dict:
         self._publish_event(f"{label}: face heading 180 then move forward")
-        self._execute_rotation_to_heading(180.0, f"{label} turn around")
+        self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, f"{label} turn around")
         return self._execute_segment(
-            0.0,
+            HEADING_FORWARD_DEG,
             distance_m,
             watch_sensors,
             mission,
@@ -868,6 +865,37 @@ class RobotManager(Node):
             )
         return self._mission_direction_move(body_direction, distance_cm, timeout_s)
 
+    @staticmethod
+    def _lateral_forward_heading_and_bias(direction: str) -> tuple[float, int]:
+        direction = direction.upper()
+        if direction == "R":
+            return forward_heading_for_world_direction("R"), RIGHT
+        if direction == "L":
+            return forward_heading_for_world_direction("L"), LEFT
+        raise RuntimeError(f"lateral forward move requires L/R, got {direction}")
+
+    def _execute_lateral_as_forward(
+        self,
+        direction: str,
+        distance_cm: float,
+        *,
+        label: str,
+        bias_note: str,
+    ) -> dict:
+        heading_deg, bias = self._lateral_forward_heading_and_bias(direction)
+        distance_cm = abs(float(distance_cm))
+        self._publish_event(
+            f"{label}: face {heading_deg:.0f}deg, forward {distance_cm:.1f}cm; "
+            f"front avoidance bias {direction_name(bias)} {bias_note}"
+        )
+        previous_bias = self.front_avoidance_bias_override
+        self.front_avoidance_bias_override = bias
+        try:
+            self._execute_rotation_to_heading(heading_deg, f"{label} face lateral travel")
+            return self._mission_direction_move("F", distance_cm, 0.0)
+        finally:
+            self.front_avoidance_bias_override = previous_bias
+
     def _reset_map_pose(self) -> None:
         self.map_pose = AudixStoreMap.SPAWN
         self._publish_event(
@@ -899,13 +927,26 @@ class RobotManager(Node):
         if abs(dx) <= 0.25:
             self.map_pose = MapPoint(float(target_x_cm), self.map_pose.y_cm)
             return
+
         direction = "R" if dx > 0.0 else "L"
-        self._execute_mapped_move(
-            direction,
-            abs(dx),
-            MapPoint(float(target_x_cm), self.map_pose.y_cm),
-            label,
+        distance_cm = abs(dx)
+        target = MapPoint(float(target_x_cm), self.map_pose.y_cm)
+        self._publish_event(
+            "map lane shift "
+            f"{label}: {direction} {distance_cm:.1f}cm "
+            f"-> x={target.x_cm:.1f} y={target.y_cm:.1f}"
         )
+        done = self._execute_lateral_as_forward(
+            direction,
+            distance_cm,
+            label=f"map lane shift {label}",
+            bias_note="toward shelf",
+        )
+
+        result = str(done.get("result", ""))
+        if result not in MAP_MOVE_OK_RESULTS:
+            raise RuntimeError(f"map lane shift {label} failed: {result or done.get('message', 'unknown')}")
+        self.map_pose = target
 
     def _move_map_y(self, target_y_cm: float, label: str) -> None:
         dy = float(target_y_cm) - self.map_pose.y_cm
@@ -927,15 +968,16 @@ class RobotManager(Node):
         self._publish_event(
             f"target {side_name}: lane_x={lane_x:.1f} audit_y={AudixStoreMap.AUDIT_Y_CM:.1f}"
         )
+        self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} lane travel face forward")
         self._move_map_y(AudixStoreMap.TOP_TRAVEL_Y_CM, "top clear corridor")
         self._move_map_x(lane_x, f"{side_name} lane center")
+        self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{side_name} audit row face forward")
         self._move_map_y(AudixStoreMap.AUDIT_Y_CM, f"{side_name} audit row")
 
     def _execute_rotation_in_place(self, direction: str, degrees: float, label: str) -> None:
         self._raise_if_cancelled()
         direction = direction.lower()
-        sign = -1.0 if direction in {"left", "ccw"} else 1.0
-        target = self.args.heading + sign * abs(float(degrees))
+        target = self.args.heading + rotation_delta_for_turn_direction(direction, degrees)
         timeout_s = max(10.0, abs(float(degrees)) / 18.0 + 5.0)
         self._publish_event(f"rotate {label}: {direction} {degrees:.1f}deg")
         future = self._send_move_future(0.0, 0.0, target, timeout_s)
@@ -1066,18 +1108,20 @@ class RobotManager(Node):
                 self._raise_if_cancelled()
                 final_side = index == len(sides) - 1
                 self._go_to_audit_side(side)
-                face_direction = AudixStoreMap.FACE_ROTATION[side]
-                return_direction = AudixStoreMap.RETURN_ROTATION[side]
-                self._execute_rotation_in_place(face_direction, 90.0, f"face {AudixStoreMap.SIDE_NAME[side]}")
+                scan_heading = AudixStoreMap.SCAN_HEADING_DEG[side]
+                self._execute_rotation_to_heading(scan_heading, f"face {AudixStoreMap.SIDE_NAME[side]}")
                 side_scans_complete = False
                 try:
                     self._audit_side_levels(side, levels)
                     side_scans_complete = True
                 finally:
-                    if not self.cancel_mission.is_set() and not (final_side and side_scans_complete):
-                        self._execute_rotation_in_place(return_direction, 90.0, "return forward")
+                    if not self.cancel_mission.is_set():
+                        if final_side and side_scans_complete:
+                            self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, "final scan face lane start")
+                        else:
+                            self._execute_rotation_to_heading(HEADING_FORWARD_DEG, "return forward before next lane")
 
-            self._execute_rotation_to_heading(180.0, "mission complete face home")
+            self._execute_rotation_to_heading(HEADING_BACKWARD_DEG, "mission complete face home")
             self._go_home_to_odom_zero("mission complete home")
             self._publish_event(
                 f"audit mission complete x={self.map_pose.x_cm:.1f} y={self.map_pose.y_cm:.1f}"
@@ -1174,8 +1218,7 @@ class RobotManager(Node):
             response.message = "direction must be left/right or ccw/cw"
             response.heading_deg = self._current_heading_deg()
             return response
-        sign = -1.0 if direction in {"left", "ccw"} else 1.0
-        target = self._current_heading_deg() + sign * abs(float(request.degrees))
+        target = self._current_heading_deg() + rotation_delta_for_turn_direction(direction, request.degrees)
 
         with self.motion_lock:
             try:
@@ -1296,16 +1339,21 @@ class RobotManager(Node):
                 self._wait_for_telemetry(newer_than_s=completed_s, timeout_s=3.0)
                 continue
 
-            direction = "L" if strafe_cm > 0.0 else "R"
+            direction = "R" if strafe_cm > 0.0 else "L"
             distance_cm = abs(strafe_cm)
             self._publish_event(
-                f"{label}: home pass {home_pass} world strafe {direction} {distance_cm:.1f}cm"
+                f"{label}: home pass {home_pass} world lateral {direction} {distance_cm:.1f}cm"
             )
-            done = self._mission_world_direction_move(direction, distance_cm, 0.0)
+            done = self._execute_lateral_as_forward(
+                direction,
+                distance_cm,
+                label=f"{label}: home pass {home_pass} lateral {direction}",
+                bias_note="during home return",
+            )
             result = str(done.get("result", ""))
             if result not in MAP_MOVE_OK_RESULTS:
                 raise RuntimeError(
-                    f"home strafe correction failed: {result or done.get('message', 'unknown')}"
+                    f"home lateral correction failed: {result or done.get('message', 'unknown')}"
                 )
             completed_s = time.monotonic()
             if self.home_settle_s > 0.0:
@@ -1322,7 +1370,7 @@ class RobotManager(Node):
                 f"home residual world odom forward={forward_cm:.1f}cm strafe={strafe_cm:.1f}cm"
             )
 
-        self._execute_rotation_to_heading(0.0, f"{label} face forward")
+        self._execute_rotation_to_heading(HEADING_FORWARD_DEG, f"{label} face forward")
 
         self.map_pose = AudixStoreMap.SPAWN
         self.pose.reset_world()

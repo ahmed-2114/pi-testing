@@ -236,7 +236,12 @@ ir_pull_up
 verbose_serial
 ```
 
-ROS odometry uses standard `x` forward, `y` lateral, yaw around `z`. If the robot appears mirrored in RViz, change `odom_strafe_sign` or `odom_forward_sign` instead of changing the ESP firmware.
+ROS odometry uses standard `x` forward, `y` left, yaw around `z`. Positive yaw
+is left/CCW by the right-hand rule; negative yaw is right/CW. If translation
+appears mirrored in RViz, change `odom_strafe_sign` or `odom_forward_sign`
+instead of changing the ESP firmware. If rotation is mirrored, fix the ESP
+hardware-boundary yaw/rotate calibration so ROS-facing yaw remains
+right-hand-rule compliant.
 
 ## Micro-ROS Migration Rule
 

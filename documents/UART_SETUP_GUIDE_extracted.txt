@@ -126,6 +126,8 @@ TURN
 Format:
 TURN seq=2 heading=90 speed=12 timeout=12000
 This performs an in-place heading move only.
+Heading follows the standard right-hand rule: positive heading/yaw is left/CCW,
+negative heading/yaw is right/CW.
 TWIST
 Format:
 TWIST seq=3 forward=10 strafe=0 turn=0 timeout=1000

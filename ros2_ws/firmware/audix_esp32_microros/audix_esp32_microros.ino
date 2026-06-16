@@ -665,10 +665,10 @@ void updateMecanumTargets() {
   float omega = constrain(commandRotateRpm, -RPM_TARGET_LIMIT, RPM_TARGET_LIMIT) * (float)rotateSign;
 
   // Confirmed logical order [BR, FR, BL, FL].
-  rawTargetRpm[0] = vx - vy - omega;
-  rawTargetRpm[1] = vx + vy - omega;
-  rawTargetRpm[2] = vx + vy + omega;
-  rawTargetRpm[3] = vx - vy + omega;
+  rawTargetRpm[0] = vx - vy + omega;
+  rawTargetRpm[1] = vx + vy + omega;
+  rawTargetRpm[2] = vx + vy - omega;
+  rawTargetRpm[3] = vx - vy - omega;
 
   float maxAbsTarget = 0.0f;
   for (uint8_t i = 0; i < 4; i++) {
@@ -840,10 +840,11 @@ void updatePositionController(float dt) {
   }
 
   float yawControlRpm = runYawPositionController(positionErrorYawDeg, positionMaxRpm);
-  // The heading loop works in displayed odometry yaw convention. updateMecanumTargets()
-  // applies rotateSign for manual rotate commands, so pre-convert here to avoid closing
-  // the position loop through the wrong sign.
-  commandRotateRpm = yawControlRpm * (float)rotateSign;
+  // The heading loop works in the displayed/right-hand-rule yaw convention:
+  // left/CCW is positive, right/CW is negative. Keep commandRotateRpm in that
+  // logical convention and let updateMecanumTargets() apply the calibrated
+  // hardware rotateSign exactly once at the wheel-mixing boundary.
+  commandRotateRpm = yawControlRpm;
   updateMecanumTargets();
 }
 
